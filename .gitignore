@@ -1,0 +1,25 @@
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# CI artifacts
+plan.txt
+plan.json
+state.json
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
