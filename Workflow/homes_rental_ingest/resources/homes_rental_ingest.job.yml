@@ -1,0 +1,17 @@
+resources:
+  jobs:
+    homes_rental_ingest:
+      name: homes_rental_ingest
+      description: HOME'S の賃貸物件データを取り込み、Unity Catalog に保存する（現在は CI/CD 確認用の雛形）
+      # 同じジョブが重なって走り、同じデータを二重に取り込まないようにする
+      max_concurrent_runs: 1
+      parameters:
+        - name: catalog
+          default: ${var.catalog}
+        - name: schema
+          default: ${var.schema}
+      tasks:
+        # クラスタを指定しないとサーバーレスで動く（Free Edition はサーバーレスのみ）
+        - task_key: ingest
+          notebook_task:
+            notebook_path: ../src/ingest.py

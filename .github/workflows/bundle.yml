@@ -1,0 +1,138 @@
+name: bundle
+
+# Workflow/<ジョブ名>/databricks.yml を 1 つのバンドルとして扱う
+# PR: validate と plan（本番に何が反映されるかの予告）を実行し、結果を PR にコメントする
+# main へのマージ: 本番（prod ターゲット）にデプロイし、Notion のリソース台帳を更新する
+on:
+  pull_request:
+    paths:
+      - "Workflow/**"
+      - "scripts/notion_sync_bundle.py"
+      - ".github/workflows/bundle.yml"
+  push:
+    branches: [main]
+    paths:
+      - "Workflow/**"
+      - "scripts/notion_sync_bundle.py"
+      - ".github/workflows/bundle.yml"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+# 本番デプロイが同時に走らないようにする。PR は新しい push が来たら古い実行を止める
+concurrency:
+  group: bundle-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+  DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
+  DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
+  # Databricks CLI のバージョンを固定し、CLI の更新で突然挙動が変わらないようにする
+  DATABRICKS_CLI_VERSION: "1.24.0"
+
+jobs:
+  # Workflow/ 直下の databricks.yml を探し、後続のジョブで 1 バンドルずつ処理できるようにする
+  discover:
+    runs-on: ubuntu-26.04
+    outputs:
+      bundles: ${{ steps.find.outputs.bundles }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: find
+        run: |
+          bundles=$(find Workflow -mindepth 2 -maxdepth 2 -name databricks.yml -exec dirname {} \; | sort | jq -R . | jq -cs .)
+          echo "見つかったバンドル: $bundles"
+          echo "bundles=$bundles" >> "$GITHUB_OUTPUT"
+
+  plan:
+    needs: discover
+    if: github.event_name == 'pull_request' && needs.discover.outputs.bundles != '[]'
+    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix:
+        bundle: ${{ fromJson(needs.discover.outputs.bundles) }}
+    defaults:
+      run:
+        working-directory: ${{ matrix.bundle }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: databricks/setup-cli@v1.23.0
+        with:
+          version: ${{ env.DATABRICKS_CLI_VERSION }}
+
+      - name: bundle validate（dev / prod）
+        run: |
+          databricks bundle validate --strict -t dev
+          databricks bundle validate --strict -t prod
+
+      - name: bundle plan（prod）
+        run: |
+          set -o pipefail
+          databricks bundle plan -t prod 2>&1 | tee plan.txt
+          databricks bundle plan -t prod -o json > plan.json
+
+      - name: Notion 同期のプレビュー
+        run: |
+          databricks bundle summary -t prod -o json > summary.json
+          python3 "$GITHUB_WORKSPACE/scripts/notion_sync_bundle.py" --plan plan.json --summary summary.json --dry-run
+
+      - name: plan の結果を PR にコメント
+        if: always()
+        uses: actions/github-script@v9
+        env:
+          BUNDLE_DIR: ${{ matrix.bundle }}
+        with:
+          script: |
+            const fs = require('fs');
+            const dir = process.env.BUNDLE_DIR;
+            const path = `${dir}/plan.txt`;
+            const plan = fs.existsSync(path) ? fs.readFileSync(path, 'utf8').slice(-60000) : 'plan が実行されませんでした。ログを確認してください。';
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: context.issue.number,
+              body: `### bundle plan（prod）: \`${dir}\`\n\`\`\`\n${plan}\n\`\`\``
+            });
+
+  deploy:
+    needs: discover
+    if: github.event_name == 'push' && needs.discover.outputs.bundles != '[]'
+    runs-on: ubuntu-26.04
+    environment: production
+    strategy:
+      # 1 バンドルずつ順番にデプロイする。1 つ失敗しても残りは続ける
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        bundle: ${{ fromJson(needs.discover.outputs.bundles) }}
+    defaults:
+      run:
+        working-directory: ${{ matrix.bundle }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: databricks/setup-cli@v1.23.0
+        with:
+          version: ${{ env.DATABRICKS_CLI_VERSION }}
+
+      - name: bundle validate（prod）
+        run: databricks bundle validate --strict -t prod
+
+      # deploy 前に plan を保存しておき、Notion に「何が変わったか」を書くのに使う
+      - name: bundle plan（prod）
+        run: databricks bundle plan -t prod -o json > plan.json
+
+      - name: bundle deploy（prod）
+        run: databricks bundle deploy -t prod --auto-approve
+
+      - name: Notion のリソース台帳を更新
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DATABASE_ID: ${{ vars.NOTION_DATABASE_ID }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          databricks bundle summary -t prod -o json > summary.json
+          python3 "$GITHUB_WORKSPACE/scripts/notion_sync_bundle.py" --plan plan.json --summary summary.json
