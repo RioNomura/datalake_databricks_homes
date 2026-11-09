@@ -1,0 +1,50 @@
+# HOME'S 賃貸物件データの取り込みジョブ（DABs: Databricks Asset Bundles）
+# ジョブの定義（resources/）とコード（src/）をまとめてワークスペースにデプロイする単位
+bundle:
+  name: homes_rental_ingest
+
+include:
+  - resources/*.yml
+
+# 取り込み先。カタログとスキーマ自体は databricks_datalake_infra（Terraform）で作る
+variables:
+  catalog:
+    description: 取り込み先のカタログ
+    default: rental_property
+  schema:
+    description: 取り込み先のスキーマ
+    default: bronze
+  deployer_sp:
+    description: 本番にデプロイし、本番ジョブを実行するサービスプリンシパルの Application ID（認証情報ではなく識別子）
+    default: 221d2ebd-9ea0-4cd0-9e33-8777996148f9
+
+# 接続先のワークスペース。ローカルでは ~/.databrickscfg の同じ host のプロファイルが使われ、
+# GitHub Actions では環境変数（サービスプリンシパル）で認証する
+workspace:
+  host: https://dbc-2a2c854e-a5da.cloud.databricks.com
+
+targets:
+  # 開発用。各自がローカルから `databricks bundle deploy` する
+  # ジョブ名に「[dev ユーザー名]」が付き、スケジュールは止まった状態でデプロイされる
+  dev:
+    mode: development
+    default: true
+
+  # 本番用。main にマージされたときに GitHub Actions だけがデプロイする
+  prod:
+    mode: production
+    workspace:
+      # GitHub Actions のサービスプリンシパル（github-actions-terraform）のフォルダに置く。
+      # 置き場所を 1 か所に固定し、他のユーザーには書き換えられないようにするため
+      # （/Workspace/Shared は全ユーザーが書き換えられるので避ける）
+      root_path: /Workspace/Users/${var.deployer_sp}/.bundle/${bundle.name}/${bundle.target}
+    # 本番のジョブは、誰がデプロイしてもサービスプリンシパルの権限で動かす
+    run_as:
+      service_principal_name: ${var.deployer_sp}
+    permissions:
+      # デプロイ先フォルダの持ち主であるサービスプリンシパル自身（フォルダに付いている権限と揃える）
+      - service_principal_name: ${var.deployer_sp}
+        level: CAN_MANAGE
+      # デプロイするのはサービスプリンシパルなので、管理者グループ（admins）も管理できるようにしておく
+      - group_name: admins
+        level: CAN_MANAGE
