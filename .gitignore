@@ -23,3 +23,7 @@ __pycache__/
 
 # OS
 .DS_Store
+
+# Databricks Asset Bundles
+.databricks/
+summary.json
