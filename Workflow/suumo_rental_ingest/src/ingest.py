@@ -7,9 +7,10 @@
   - robots.txt で禁止されたパスは取らない。詳細ページには行かない
 
 取り込み方:
-  - 全件は読まない（約 2,500 ページあり、30 秒間隔だと約 21 時間かかるため）
-  - 初回（テーブルが空）: 新着順の先頭から --initial-pages ページだけ読む
-  - 2 回目以降: 新着順の先頭から読み、新しい部屋が無いページが --stop-after-known-pages 回続いたら止める
+  - 初回（全件読み込み）: 新着順の先頭から最後のページまで読む（大阪市で約 630 ページ、30 秒間隔で約 6 時間）。
+    --initial-pages を 1 以上にすると、そのページ数で止めて完了扱いにする（動作確認用）
+    途中で止まっても続きから読めるよう、ページを書き込むたびに再開位置を状態テーブルに保存し、次の実行で続きから読む
+  - 全件読み込みが終わった後（増分）: 新着順の先頭から読み、新しい部屋が無いページが --stop-after-known-pages 回続いたら止める
   - すでに取り込んだ部屋（room_code = SUUMO の bc）は書かない。テーブルは 1 部屋 1 行（初めて見つけたときの内容）
   - bronze なので値はページ上の文字列のまま（「6.5万円」→ 数値 は silver でやる）
 
@@ -114,6 +115,13 @@ def parse_list_page(html: str, source_url: str, page: int) -> list[dict]:
     return rows
 
 
+def parse_last_page(html: str) -> int | None:
+    """ページ送りに出ている最大のページ番号（最後のページ）。"""
+    soup = BeautifulSoup(html, "lxml")
+    nums = [int(t) for t in (a.get_text(strip=True) for a in soup.select(".pagination a, .pagination li")) if t.isdigit()]
+    return max(nums) if nums else None
+
+
 def parse_total_count(html: str) -> str | None:
     m = re.search(r'paginate_set-hit">\s*([\d,]+)', html)
     return m.group(1) if m else None
@@ -169,17 +177,27 @@ def page_url(list_url: str, page: int) -> str:
     return f"{list_url}{'&' if '?' in list_url else '?'}page={page}"
 
 
-def crawl(fetch_page, known: set[str], max_pages: int, stop_after_known_pages: int, flush_pages: int, on_flush) -> dict:
-    """新着順の 1 ページ目から読み、まだ取り込んでいない部屋だけを集める。
+def crawl(
+    fetch_page,
+    known: set[str],
+    max_pages: int,
+    stop_after_known_pages: int,
+    flush_pages: int,
+    on_flush,
+    start_page: int = 1,
+    last_page=lambda: None,
+) -> dict:
+    """新着順の start_page から読み、まだ取り込んでいない部屋だけを集める。
 
     fetch_page(page) -> rows（取得できない・最後のページを過ぎたら空）。Blocked が飛んだらそこで止める。
-    on_flush(rows) を flush_pages ページごとと最後に呼ぶ。
-    stop_after_known_pages が 0 なら「追いついたら止める」はせず、max_pages まで読む（初回用）。
+    on_flush(rows, next_page) を flush_pages ページごとと最後に呼ぶ（next_page = 次に読むページ = 再開位置）。
+    stop_after_known_pages が 0 なら「追いついたら止める」はせず、max_pages（0 なら無制限）か最後のページまで読む。
+    last_page() は最後のページ番号（分かれば）。そのページを読んだら reached_end で止める。
     """
     buf: list[dict] = []
     pages = new_total = streak = 0
     caught_up = reached_end = blocked = False
-    page = 1
+    page = start_page
     while True:
         try:
             rows = fetch_page(page)
@@ -188,7 +206,7 @@ def crawl(fetch_page, known: set[str], max_pages: int, stop_after_known_pages: i
             blocked = True
             break
         if not rows:
-            if page == 1:
+            if page == start_page == 1:
                 raise RuntimeError("1 ページ目から 1 件も取れませんでした。ページの構造が変わった可能性があります")
             reached_end = True
             break
@@ -203,17 +221,22 @@ def crawl(fetch_page, known: set[str], max_pages: int, stop_after_known_pages: i
         new_total += len(new_rows)
         print(f"page {page}: {len(rows)} 部屋（うち新規 {len(new_rows)}）")
         streak = 0 if new_rows else streak + 1
+        lp = last_page()
+        page += 1
         if pages % flush_pages == 0:
-            on_flush(buf)
+            on_flush(buf, page)
             buf = []
         if stop_after_known_pages and streak >= stop_after_known_pages:
             caught_up = True
             break
+        if lp and page > lp:
+            reached_end = True
+            break
         if max_pages and pages >= max_pages:
             break
-        page += 1
-    on_flush(buf)
-    return {"pages": pages, "new_rows": new_total, "caught_up": caught_up, "reached_end": reached_end, "blocked": blocked}
+    on_flush(buf, page)
+    return {"pages": pages, "new_rows": new_total, "next_page": page, "caught_up": caught_up,
+            "reached_end": reached_end, "blocked": blocked}
 
 
 def main(argv: list[str]) -> None:
@@ -221,9 +244,11 @@ def main(argv: list[str]) -> None:
     p.add_argument("--catalog", required=True)
     p.add_argument("--schema", required=True)
     p.add_argument("--table", default="suumo_rental_listings")
+    p.add_argument("--state-table", default="suumo_rental_ingest_state")
     p.add_argument("--list-url", required=True, help="新着順（po1=09）の一覧 URL")
-    p.add_argument("--initial-pages", type=int, default=20, help="初回（テーブルが空）に読むページ数")
-    p.add_argument("--max-pages", type=int, default=400, help="2 回目以降に 1 回で読む最大ページ数")
+    p.add_argument("--initial-pages", type=int, default=0,
+                   help="全件読み込みで読むページ数。0 なら最後のページまで（1 以上は動作確認用）")
+    p.add_argument("--max-pages", type=int, default=400, help="増分の 1 回で読む最大ページ数（止まらなくなったときの安全装置）")
     p.add_argument("--stop-after-known-pages", type=int, default=3)
     p.add_argument("--delay", type=float, default=30.0, help="リクエストの間隔（秒）。robots.txt の Crawl-delay に合わせる")
     p.add_argument("--flush-pages", type=int, default=20)
@@ -240,13 +265,47 @@ def main(argv: list[str]) -> None:
 
     spark = SparkSession.builder.getOrCreate()
     target = f"{args.catalog}.{args.schema}.{args.table}"
+    state_table = f"{args.catalog}.{args.schema}.{args.state_table}"
     run_id = str(uuid.uuid4())
+
+    def utc_now() -> dt.datetime:
+        return dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+
+    # ---- 状態（全件読み込みの進み具合）。1 行だけのテーブル
+    state_schema = T.StructType(
+        [
+            T.StructField("initial_load_status", T.StringType()),  # in_progress / completed
+            T.StructField("next_page", T.IntegerType()),  # 全件読み込みを再開するページ
+            T.StructField("initial_load_started_at", T.TimestampType()),
+            T.StructField("initial_load_completed_at", T.TimestampType()),
+            T.StructField("last_run_id", T.StringType()),
+            T.StructField("last_mode", T.StringType()),
+            T.StructField("updated_at", T.TimestampType()),
+        ]
+    )
+
+    def write_state(st: dict) -> None:
+        st = {**st, "last_run_id": run_id, "updated_at": utc_now()}
+        spark.createDataFrame([tuple(st.get(f.name) for f in state_schema)], state_schema) \
+            .write.mode("overwrite").saveAsTable(state_table)
+
+    state = spark.table(state_table).first().asDict() if spark.catalog.tableExists(state_table) else None
+    if state and state.get("initial_load_status") == "completed":
+        mode, start_page = "incremental", 1
+        state["last_mode"] = mode
+    else:
+        mode = "initial"
+        start_page = (state or {}).get("next_page") or 1
+        state = {
+            "initial_load_status": "in_progress",
+            "next_page": start_page,
+            "initial_load_started_at": (state or {}).get("initial_load_started_at") or utc_now(),
+            "last_mode": mode,
+        }
 
     known: set[str] = set()
     if spark.catalog.tableExists(target):
         known = {r[0] for r in spark.table(target).select("room_code").where("room_code IS NOT NULL").distinct().collect()}
-    first_run = not known
-    mode = "initial" if first_run else "incremental"
 
     schema = T.StructType(
         [
@@ -258,24 +317,28 @@ def main(argv: list[str]) -> None:
     )
     written = 0
 
-    def on_flush(rows: list[dict]) -> None:
+    def on_flush(rows: list[dict], next_page: int) -> None:
         nonlocal written
-        if not rows:
-            return
-        now = dt.datetime.now(JST)
-        (
-            spark.createDataFrame([tuple(r.get(c) for c in COLUMNS) for r in rows], schema)
-            .withColumn("ingest_mode", F.lit(mode))
-            .withColumn("ingest_run_id", F.lit(run_id))
-            .withColumn("ingested_at", F.lit(now.astimezone(dt.timezone.utc).replace(tzinfo=None)).cast("timestamp"))
-            .withColumn("ingest_date", F.lit(now.date().isoformat()).cast("date"))
-            .write.mode("append")
-            .option("mergeSchema", "true")
-            .saveAsTable(target)
-        )
-        written += len(rows)
+        if rows:
+            now = dt.datetime.now(JST)
+            (
+                spark.createDataFrame([tuple(r.get(c) for c in COLUMNS) for r in rows], schema)
+                .withColumn("ingest_mode", F.lit(mode))
+                .withColumn("ingest_run_id", F.lit(run_id))
+                .withColumn("ingested_at", F.lit(now.astimezone(dt.timezone.utc).replace(tzinfo=None)).cast("timestamp"))
+                .withColumn("ingest_date", F.lit(now.date().isoformat()).cast("date"))
+                .write.mode("append")
+                .option("mergeSchema", "true")
+                .saveAsTable(target)
+            )
+            written += len(rows)
+        # 書き込みのあとで再開位置を保存する（途中で止まっても、次の実行はここから続ける）
+        if mode == "initial":
+            state["next_page"] = next_page
+            write_state(state)
 
     fetcher = Fetcher(delay=args.delay)
+    last_page: dict[str, int | None] = {"value": None}
 
     def fetch_page(page: int) -> list[dict]:
         url = page_url(args.list_url, page)
@@ -284,23 +347,38 @@ def main(argv: list[str]) -> None:
         except requests.HTTPError as e:
             print(f"page {page} を取得できませんでした（最後のページを過ぎたとみなす）: {e}")
             return []
-        if page == 1:
-            print(f"サイト上の掲載物件総数: {parse_total_count(html)}")
+        # 新着が増えると最後のページ番号も増えるので、毎ページ読み直す（ページ送りに出ている最大値）
+        lp = parse_last_page(html)
+        if lp:
+            last_page["value"] = max(lp, page)
+        if page == start_page:
+            print(f"サイト上の掲載物件総数: {parse_total_count(html)} / 最後のページ: {last_page['value']}")
         return parse_list_page(html, url, page)
 
-    print(f"モード: {mode} / 取り込み済みの部屋: {len(known)} / 取り込み先: {target} / run_id: {run_id}")
-    result = crawl(
-        fetch_page,
-        known=known,
-        max_pages=args.initial_pages if first_run else args.max_pages,
-        stop_after_known_pages=0 if first_run else args.stop_after_known_pages,
-        flush_pages=args.flush_pages,
-        on_flush=on_flush,
-    )
+    print(f"モード: {mode} / 開始ページ: {start_page} / 取り込み済みの部屋: {len(known)} / "
+          f"取り込み先: {target} / run_id: {run_id}")
+    if mode == "initial":
+        remaining = args.initial_pages - (start_page - 1) if args.initial_pages else 0
+        if args.initial_pages and remaining <= 0:
+            remaining = 1
+        result = crawl(fetch_page, known, max_pages=remaining, stop_after_known_pages=0,
+                       flush_pages=args.flush_pages, on_flush=on_flush, start_page=start_page,
+                       last_page=lambda: last_page["value"])
+        limit_reached = bool(args.initial_pages) and result["next_page"] > args.initial_pages
+        if (result["reached_end"] or limit_reached) and not result["blocked"]:
+            state.update({"initial_load_status": "completed", "initial_load_completed_at": utc_now()})
+            write_state(state)
+            print("全件読み込みが完了しました。次の実行からは増分になります")
+        else:
+            print(f"全件読み込みの途中で止まりました。次の実行は page {result['next_page']} から続けます")
+    else:
+        result = crawl(fetch_page, known, max_pages=args.max_pages, stop_after_known_pages=args.stop_after_known_pages,
+                       flush_pages=args.flush_pages, on_flush=on_flush)
+        write_state(state)
+        if not (result["caught_up"] or result["reached_end"] or result["blocked"]):
+            print(f"注意: 取り込み済みの部屋に追いつく前に上限（{args.max_pages} ページ）に達しました。"
+                  "この間の新着は取りこぼしている可能性があります。max_pages か実行頻度を見直してください")
     print(f"完了: {result['pages']} ページを読み、新しい部屋 {written} 件を {target} に追記しました")
-    if not first_run and not (result["caught_up"] or result["reached_end"] or result["blocked"]):
-        print(f"注意: 取り込み済みの部屋に追いつく前に上限（{args.max_pages} ページ）に達しました。"
-              "この間の新着は取りこぼしている可能性があります。max_pages か実行頻度を見直してください")
     if result["blocked"]:
         raise RuntimeError("サイトのボット対策に止められました。再試行や回避はしません。取り込み方を見直してください")
 
