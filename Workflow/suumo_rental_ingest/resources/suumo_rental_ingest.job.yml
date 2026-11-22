@@ -1,0 +1,62 @@
+resources:
+  jobs:
+    suumo_rental_ingest:
+      name: suumo_rental_ingest
+      description: SUUMO の大阪市の賃貸一覧（新着順）から、新しく掲載された部屋だけを bronze テーブル（${var.catalog}.${var.schema}.suumo_rental_listings）に追記する。個人の私的利用に限る
+      # 同じジョブが重なって走り、同じページに二重にアクセスしないようにする
+      max_concurrent_runs: 1
+      # 400 ページ × 約 31 秒 ≒ 3.5 時間が上限なので 4 時間。止まっても次の実行は新着順の先頭から読み直す
+      timeout_seconds: 14400
+      # 急ぎのジョブではないので、起動は遅いが安い STANDARD にする
+      performance_target: STANDARD
+      tags:
+        source: suumo
+        layer: bronze
+      # 毎日 04:00（日本時間）。HOME'S のジョブ（03:00）と時間をずらす。dev ターゲットでは自動で一時停止される
+      schedule:
+        quartz_cron_expression: "0 0 4 * * ?"
+        timezone_id: Asia/Tokyo
+        pause_status: UNPAUSED
+      parameters:
+        - name: catalog
+          default: ${var.catalog}
+        - name: schema
+          default: ${var.schema}
+        # 大阪市の全 24 区・1 ページ 50 件（pc=50）・新着順（po1=09）。増分の判定は新着順が前提なので po1=09 は外さない
+        - name: list_url
+          default: "https://suumo.jp/jj/chintai/ichiran/FR301FC001/?ar=060&bs=040&pc=50&smk=&po1=09&po2=99&shkr1=03&shkr2=03&shkr3=03&shkr4=03&sc=27102&sc=27103&sc=27104&sc=27106&sc=27107&sc=27108&sc=27109&sc=27111&sc=27113&sc=27114&sc=27115&sc=27116&sc=27117&sc=27118&sc=27119&sc=27120&sc=27121&sc=27122&sc=27123&sc=27124&sc=27125&sc=27126&sc=27127&sc=27128&ta=27&cb=0.0&ct=9999999&et=9999999&mb=0&mt=9999999&cn=9999999&fw2="
+        # 初回（テーブルが空）に読むページ数。1 ページ = 50 棟。全件は読まない
+        - name: initial_pages
+          default: "20"
+        # 2 回目以降に 1 回で読む最大ページ数。超えたら警告を出す（その間の新着を取りこぼしている可能性）
+        - name: max_pages
+          default: "400"
+        # 新しい部屋が無いページがこの回数続いたら「追いついた」として止める
+        - name: stop_after_known_pages
+          default: "3"
+        # リクエスト間隔（秒）。robots.txt の Crawl-delay（30 秒）に合わせる。30 未満はスクリプトが拒否する
+        - name: delay_seconds
+          default: "30"
+      # Python スクリプトのタスクが使うライブラリ。バージョンを固定して、更新で突然壊れないようにする
+      environments:
+        - environment_key: scraper
+          spec:
+            environment_version: "4"
+            dependencies:
+              - requests==2.32.3
+              - beautifulsoup4==4.13.4
+              - lxml==5.3.0
+      tasks:
+        # クラスタを指定しないとサーバーレスで動く（Free Edition はサーバーレスのみ）
+        - task_key: ingest
+          environment_key: scraper
+          spark_python_task:
+            python_file: ../src/ingest.py
+            parameters:
+              - --catalog={{job.parameters.catalog}}
+              - --schema={{job.parameters.schema}}
+              - --list-url={{job.parameters.list_url}}
+              - --initial-pages={{job.parameters.initial_pages}}
+              - --max-pages={{job.parameters.max_pages}}
+              - --stop-after-known-pages={{job.parameters.stop_after_known_pages}}
+              - --delay={{job.parameters.delay_seconds}}
