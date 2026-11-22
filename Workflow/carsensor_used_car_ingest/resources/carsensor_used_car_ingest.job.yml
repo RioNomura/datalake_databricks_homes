@@ -2,7 +2,7 @@ resources:
   jobs:
     carsensor_used_car_ingest:
       name: carsensor_used_car_ingest
-      description: カーセンサーの中古車一覧（AT・修復歴なし・ディーラー車・関東ほか、新着順）を bronze テーブル（${var.catalog}.${var.schema}.carsensor_used_car_listings）に取り込む。初回は全件、その後は新しく掲載された車だけ。掲載終了は sitemap で毎日判定する。画像は取らない。個人の私的利用に限る
+      description: カーセンサーの中古車一覧（関西・関東、修復歴なし、AT、メーカー系販売店、新着順）を bronze テーブル（${var.catalog}.${var.schema}.carsensor_used_car_listings）に取り込む。初回は全件、その後は新しく掲載された車だけ。掲載終了は sitemap で毎日判定する。画像は取らない。個人の私的利用に限る
       # 同じジョブが重なって走り、同じページに二重にアクセスしないようにする
       max_concurrent_runs: 1
       # 初回の全件読み込み（約 2,100 ページ × 約 11 秒 ≒ 6 時間 30 分）が収まるように 7 時間。
@@ -23,8 +23,9 @@ resources:
           default: ${var.catalog}
         - name: schema
           default: ${var.schema}
-        # AT 限定（SLST=AT）・修復歴なし（OPTCD=REP0）・関東ほか（AR=1*2）・ディーラー車（DLR=1）・新着順（SORT=19）。
-        # 増分の判定は新着順が前提なので SORT=19 は外さない
+        # 地域: 関東（1）+ 関西（2）（AR=1*2。画面のタイトルは「関東他」と出るが、両方を選んだ状態）・
+        # 修復歴なし（OPTCD=REP0）・ミッション AT（SLST=AT）・メーカー系販売店（DLR=1）・新着順（SORT=19）。
+        # 2026-11-22 時点で 関東 41,327 台 + 関西 21,357 台 = 62,684 台。増分の判定は新着順が前提なので SORT=19 は外さない
         - name: list_url
           default: "https://www.carsensor.net/usedcar/index.html?SLST=AT&OPTCD=REP0&AR=1%2A2&DLR=1&SORT=19"
         # 初回（全件読み込み）で読むページ数。0 なら最後のページまで（1 ページ = 30 台）。1 以上は動作確認用
