@@ -1,0 +1,68 @@
+resources:
+  jobs:
+    carsensor_used_car_ingest:
+      name: carsensor_used_car_ingest
+      description: カーセンサーの中古車一覧（AT・修復歴なし・ディーラー車・関東ほか、新着順）を bronze テーブル（${var.catalog}.${var.schema}.carsensor_used_car_listings）に取り込む。初回は全件、その後は新しく掲載された車だけ。掲載終了は sitemap で毎日判定する。画像は取らない。個人の私的利用に限る
+      # 同じジョブが重なって走り、同じページに二重にアクセスしないようにする
+      max_concurrent_runs: 1
+      # 初回の全件読み込み（約 2,100 ページ × 約 11 秒 ≒ 6 時間 30 分）が収まるように 7 時間。
+      # 超えて止まっても、20 ページごとに保存した再開位置から次の実行で続ける
+      timeout_seconds: 25200
+      # 急ぎのジョブではないので、起動は遅いが安い STANDARD にする
+      performance_target: STANDARD
+      tags:
+        source: carsensor
+        layer: bronze
+      # 毎日 05:00（日本時間）。SUUMO（04:00）とずらす。
+      # pause_status は書かない。書かなければ prod では有効、dev（mode: development）では自動で一時停止になる
+      schedule:
+        quartz_cron_expression: "0 0 5 * * ?"
+        timezone_id: Asia/Tokyo
+      parameters:
+        - name: catalog
+          default: ${var.catalog}
+        - name: schema
+          default: ${var.schema}
+        # AT 限定（SLST=AT）・修復歴なし（OPTCD=REP0）・関東ほか（AR=1*2）・ディーラー車（DLR=1）・新着順（SORT=19）。
+        # 増分の判定は新着順が前提なので SORT=19 は外さない
+        - name: list_url
+          default: "https://www.carsensor.net/usedcar/index.html?SLST=AT&OPTCD=REP0&AR=1%2A2&DLR=1&SORT=19"
+        # 初回（全件読み込み）で読むページ数。0 なら最後のページまで（1 ページ = 30 台）。1 以上は動作確認用
+        - name: initial_pages
+          default: "0"
+        # 増分の 1 回で読む最大ページ数（止まらなくなったときの安全装置）
+        - name: max_pages
+          default: "300"
+        # 新しい車が無いページがこの回数続いたら「追いついた」として止める
+        - name: stop_after_known_pages
+          default: "3"
+        # リクエスト間隔（秒）。robots.txt に Crawl-delay は無いが、運営を妨げないよう 10 秒以上あける（10 未満はスクリプトが拒否する）
+        - name: delay_seconds
+          default: "10"
+        # sitemap と照合して掲載終了フラグ（is_delisted）を更新するか
+        - name: delist_check
+          default: "true"
+      # Python スクリプトのタスクが使うライブラリ。バージョンを固定して、更新で突然壊れないようにする
+      environments:
+        - environment_key: scraper
+          spec:
+            environment_version: "4"
+            dependencies:
+              - requests==2.32.3
+              - beautifulsoup4==4.13.4
+              - lxml==5.3.0
+      tasks:
+        # クラスタを指定しないとサーバーレスで動く（Free Edition はサーバーレスのみ）
+        - task_key: ingest
+          environment_key: scraper
+          spark_python_task:
+            python_file: ../src/ingest.py
+            parameters:
+              - --catalog={{job.parameters.catalog}}
+              - --schema={{job.parameters.schema}}
+              - --list-url={{job.parameters.list_url}}
+              - --initial-pages={{job.parameters.initial_pages}}
+              - --max-pages={{job.parameters.max_pages}}
+              - --stop-after-known-pages={{job.parameters.stop_after_known_pages}}
+              - --delay={{job.parameters.delay_seconds}}
+              - --delist-check={{job.parameters.delist_check}}
