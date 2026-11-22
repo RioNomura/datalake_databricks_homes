@@ -19,6 +19,13 @@ scripts/notion_sync_bundle.py         デプロイ結果を Notion「リソー�
 
 新しいジョブを足すときは `Workflow/<ジョブ名>/databricks.yml` を作る。CI が自動で見つけて処理する。
 
+## homes_rental_ingest（HOME'S 大阪府の賃貸）
+
+- 取得元: `https://www.homes.co.jp/chintai/osaka/list/?page=N` の一覧ページ（詳細ページは取らない）
+- 取り込み先: `rental_property.bronze.homes_rental_listings`（1 行 = 一覧の 1 部屋、値はページ上の文字列のまま。実行ごとに追記し、`ingest_run_id` / `ingested_at` / `ingest_date` を付ける）
+- 実行: 毎週月曜 03:00 JST（prod のみ）。パラメータ `max_pages`（既定 100、0 で全ページ）と `delay_seconds`（既定 2 秒）
+- 同じ部屋が別ページに重複して出ることがあるため、重複の除去と数値化（賃料・面積など）は silver で行う
+
 ## CI/CD の流れ
 
 1. feature ブランチで `Workflow/` を編集して PR を作る

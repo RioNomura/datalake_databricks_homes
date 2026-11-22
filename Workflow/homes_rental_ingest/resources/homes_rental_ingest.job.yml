@@ -2,16 +2,49 @@ resources:
   jobs:
     homes_rental_ingest:
       name: homes_rental_ingest
-      description: HOME'S の賃貸物件データを取り込み、Unity Catalog に保存する（現在は CI/CD 確認用の雛形）
+      description: HOME'S の大阪府の賃貸一覧ページをスクレイピングし、bronze テーブル（${var.catalog}.${var.schema}.homes_rental_listings）に追記する
       # 同じジョブが重なって走り、同じデータを二重に取り込まないようにする
       max_concurrent_runs: 1
+      # 取り込みが止まらなくなったときに課金と相手サイトへのアクセスが続かないよう、上限を決めておく
+      timeout_seconds: 7200
+      # 急ぎのジョブではないので、起動は遅いが安い STANDARD にする
+      performance_target: STANDARD
+      tags:
+        source: homes
+        layer: bronze
+      # 毎週月曜 03:00（日本時間）。dev ターゲットでは自動で一時停止される
+      schedule:
+        quartz_cron_expression: "0 0 3 ? * MON"
+        timezone_id: Asia/Tokyo
+        pause_status: UNPAUSED
       parameters:
         - name: catalog
           default: ${var.catalog}
         - name: schema
           default: ${var.schema}
+        # 一覧の 1 ページ ≒ 建物 30 棟・部屋 110〜120 室。0 にすると最後のページ（約 6,700 ページ）まで取る
+        - name: max_pages
+          default: "100"
+        # 相手サイトへのリクエスト間隔（秒）。短くしすぎない
+        - name: delay_seconds
+          default: "2"
+      # Python スクリプトのタスクが使うライブラリ。バージョンを固定して、更新で突然壊れないようにする
+      environments:
+        - environment_key: scraper
+          spec:
+            environment_version: "4"
+            dependencies:
+              - requests==2.32.3
+              - beautifulsoup4==4.13.4
+              - lxml==5.3.0
       tasks:
         # クラスタを指定しないとサーバーレスで動く（Free Edition はサーバーレスのみ）
         - task_key: ingest
-          notebook_task:
-            notebook_path: ../src/ingest.py
+          environment_key: scraper
+          spark_python_task:
+            python_file: ../src/ingest.py
+            parameters:
+              - --catalog={{job.parameters.catalog}}
+              - --schema={{job.parameters.schema}}
+              - --max-pages={{job.parameters.max_pages}}
+              - --delay={{job.parameters.delay_seconds}}
