@@ -221,7 +221,10 @@ class Fetcher:
                 print(f"  取得失敗（{attempt}/{self.max_retries}）: {e}")
             else:
                 if res.status_code == 200:
-                    res.encoding = res.encoding or "utf-8"
+                    # カーセンサーは Content-Type に charset を付けないため、requests は既定の ISO-8859-1 で読んでしまい、
+                    # 日本語がすべて文字化けする（2026-11-22 の試験実行で発生）。charset が無ければ UTF-8 で読む
+                    if "charset" not in res.headers.get("Content-Type", "").lower():
+                        res.encoding = "utf-8"
                     return res.text
                 print(f"  HTTP {res.status_code}（{attempt}/{self.max_retries}）")
                 if res.status_code in BLOCKED_STATUSES:
@@ -451,7 +454,11 @@ def main(argv: list[str]) -> None:
         if lp:
             last_page["value"] = max(lp, page)
         if page == start_page:
-            print(f"サイト上の掲載台数: {parse_total_count(html)} / 最後のページ: {last_page['value']}")
+            total = parse_total_count(html)
+            print(f"サイト上の掲載台数: {total} / 最後のページ: {last_page['value']}")
+            # 文字コードを読み違えると、件数の「台」が化ける。化けたまま書き込まないよう、ここで止める
+            if not total or not total.endswith("台"):
+                raise RuntimeError(f"掲載台数を正しく読めませんでした（文字化けかページ構造の変更）: {total!r}")
         return parse_list_page(html, url, page)
 
     print(f"モード: {mode} / 開始ページ: {start_page} / 取り込み済みの車: {len(known)} / "
