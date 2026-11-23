@@ -359,6 +359,7 @@ def main(argv: list[str]) -> None:
     p.add_argument("--catalog", required=True)
     p.add_argument("--silver-schema", required=True)
     p.add_argument("--gold-schema", required=True)
+    p.add_argument("--table-suffix", default="", help="書き込むテーブル名の末尾（dev は _dev）")
     args = p.parse_args(argv)
 
     from pyspark.sql import SparkSession
@@ -386,15 +387,16 @@ def main(argv: list[str]) -> None:
     }])
     print(f"賃料モデル: 学習 {model['n_train']} 部屋 / 決定係数 {model['r2']:.3f} / 誤差の中央値 {model['mdape']:.1%}")
 
-    write_table(spark, d, f"{gold}.suumo_room_fact", FACT_COLUMNS, FACT_TABLE_COMMENT, primary_key=["room_id"])
-    write_table(spark, effects, f"{gold}.suumo_rent_factor_effects", EFFECTS_COLUMNS, EFFECTS_TABLE_COMMENT)
+    sfx = args.table_suffix
+    write_table(spark, d, f"{gold}.suumo_room_fact{sfx}", FACT_COLUMNS, FACT_TABLE_COMMENT, primary_key=["room_id"])
+    write_table(spark, effects, f"{gold}.suumo_rent_factor_effects{sfx}", EFFECTS_COLUMNS, EFFECTS_TABLE_COMMENT)
     # 精度の記録は同じ日に何度実行しても 1 行になるよう、その日の行を消してから追記する
-    metrics_table = f"{gold}.suumo_rent_model_metrics"
+    metrics_table = f"{gold}.suumo_rent_model_metrics{sfx}"
     if spark.catalog.tableExists(metrics_table):
         spark.sql(f"DELETE FROM {metrics_table} WHERE model_date = DATE'{today.isoformat()}'")
     write_table(spark, metrics, metrics_table, METRICS_COLUMNS, METRICS_TABLE_COMMENT, mode="append")
-    print(f"{gold} の suumo_room_fact（{len(d)} 部屋）/ suumo_rent_factor_effects（{len(effects)} 行）/ "
-          f"suumo_rent_model_metrics を更新しました")
+    print(f"{gold} の suumo_room_fact{sfx}（{len(d)} 部屋）/ suumo_rent_factor_effects{sfx}（{len(effects)} 行）/ "
+          f"suumo_rent_model_metrics{sfx} を更新しました")
 
 
 if __name__ == "__main__":

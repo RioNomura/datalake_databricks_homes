@@ -17,6 +17,9 @@ variables:
   gold_schema:
     description: 書き込む gold のスキーマ
     default: gold
+  table_suffix:
+    description: 書き込むテーブル名の末尾に付ける文字列。dev では _dev にして、本番のテーブル（持ち主はサービスプリンシパル）に触れないようにする
+    default: ""
   deployer_sp:
     description: 本番にデプロイし、本番ジョブを実行するサービスプリンシパルの Application ID（認証情報ではなく識別子）
     default: 221d2ebd-9ea0-4cd0-9e33-8777996148f9
@@ -32,6 +35,8 @@ targets:
   dev:
     mode: development
     default: true
+    variables:
+      table_suffix: _dev
 
   # 本番用。main にマージされたときに GitHub Actions だけがデプロイする
   prod:

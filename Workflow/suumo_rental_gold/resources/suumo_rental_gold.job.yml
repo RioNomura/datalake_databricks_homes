@@ -27,6 +27,9 @@ resources:
           default: ${var.silver_schema}
         - name: gold_schema
           default: ${var.gold_schema}
+        # 書き込むテーブル名の末尾（dev は _dev、prod は空）
+        - name: table_suffix
+          default: ${var.table_suffix}
       # pandas / numpy はサーバーレスの環境に最初から入っているので、追加のライブラリは無い
       environments:
         - environment_key: default
@@ -41,3 +44,4 @@ resources:
               - --catalog={{job.parameters.catalog}}
               - --silver-schema={{job.parameters.silver_schema}}
               - --gold-schema={{job.parameters.gold_schema}}
+              - --table-suffix={{job.parameters.table_suffix}}
