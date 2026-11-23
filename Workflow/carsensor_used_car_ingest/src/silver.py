@@ -23,38 +23,38 @@ import argparse
 import re
 import sys
 
-# silver の列と説明（テーブルの列コメントにも入れる）
-COLUMN_COMMENTS = {
-    "car_id": "物件番号（カーセンサーの BKKN）。1 台 1 行のキー",
-    "maker": "メーカー（例: トヨタ）",
-    "car_model": "車名（例: ヤリスクロス）",
-    "car_grade": "グレード（例: 1.5 ハイブリッド Z）",
-    "sub_text": "販売店のひとこと",
-    "body_type": "ボディタイプ（例: クロカン・ＳＵＶ）",
-    "color": "色（例: 黒Ｍ）",
-    "total_price": "支払総額（円）。応談は NULL",
-    "base_price": "車両本体価格（円）。応談は NULL",
-    "model_year": "年式（西暦）",
-    "model_year_jp": "年式（和暦。例: R07、H31,R01）",
-    "mileage": "走行距離（km）",
-    "inspection": "車検満了月（その月の 1 日）。車検整備付は取り込んだ月の 2 年後。車検整備無・新車未登録は NULL",
-    "warranty": "保証付なら true、保証無なら false",
-    "maintenance": "法定整備付なら true、法定整備無なら false",
-    "displacement": "排気量（cc）。不明は NULL",
-    "transmission": "ミッション（例: フロアCVT）",
-    "drive_type": "駆動方式（2WD / 4WD）。絞り込みの全件読み込みが終わるまでは NULL のことがある",
-    "engine_type": "エンジン種別（ガソリン / ディーゼル / ハイブリッド / 電気 / その他）。同上",
-    "prefecture": "販売店の都道府県",
-    "city": "販売店の市区町村",
-    "shop_code": "販売店コード",
-    "shop_name": "販売店名",
-    "shop_review_point": "販売店のクチコミ評価（点）。クチコミが無ければ NULL",
-    "shop_review_count": "販売店のクチコミ件数。クチコミが無ければ NULL",
-    "detail_url": "詳細ページの URL",
-    "ingest_date": "初めて取り込んだ日（JST）",
-    "is_delisted": "掲載終了フラグ（sitemap から消えたら true）",
-    "delisted_date": "掲載終了と判定した日（JST）",
-    "last_seen_date": "掲載中と最後に確認できた日（JST）",
+# silver の列の論理名と説明。テーブルの列コメントに「論理名：説明」の形で入れる
+COLUMNS = {
+    "car_id": ("物件番号", "カーセンサーの物件番号（BKKN）。1 台 1 行のキー"),
+    "maker": ("メーカー", "例: トヨタ"),
+    "car_model": ("車名", "例: ヤリスクロス"),
+    "car_grade": ("グレード", "例: 1.5 ハイブリッド Z"),
+    "sub_text": ("販売店コメント", "一覧に出ている販売店のひとこと"),
+    "body_type": ("ボディタイプ", "例: クロカン・ＳＵＶ"),
+    "color": ("色", "例: 黒Ｍ（Ｍ＝メタリック）"),
+    "total_price": ("支払総額", "車両本体価格に諸費用を含めた額（円）。応談は NULL"),
+    "base_price": ("車両本体価格", "円。応談は NULL"),
+    "model_year": ("年式（西暦）", "例: 2022"),
+    "model_year_jp": ("年式（和暦）", "例: R04、H31,R01"),
+    "mileage": ("走行距離", "km。メーター交換車もページの数値のまま入れる"),
+    "inspection": ("車検満了月", "満了月の 1 日の日付。車検整備付は取り込んだ月の 2 年後。車検整備無・新車未登録は NULL"),
+    "warranty": ("保証", "保証付なら true、保証無なら false"),
+    "maintenance": ("法定整備", "法定整備付なら true、法定整備無なら false"),
+    "displacement": ("排気量", "cc。不明は NULL"),
+    "transmission": ("ミッション", "例: フロアCVT、インパネAT"),
+    "drive_type": ("駆動方式", "2WD / 4WD。4WD の絞り込みに出た車が 4WD、それ以外は 2WD。絞り込みの全件読み込みが終わるまでは NULL のことがある"),
+    "engine_type": ("エンジン種別", "ガソリン / ディーゼル / ハイブリッド / 電気 / その他。燃料の絞り込みに出なかった車はガソリン。全件読み込みが終わるまでは NULL のことがある"),
+    "prefecture": ("都道府県", "販売店の所在地"),
+    "city": ("市区町村", "販売店の所在地"),
+    "shop_code": ("販売店コード", "販売店ページ URL /shop/<県>/<コード>/ のコード"),
+    "shop_name": ("販売店名", "例: ネッツトヨタ群馬 太田やぶづかインター店"),
+    "shop_review_point": ("クチコミ評価", "販売店のクチコミの点数。クチコミが無ければ NULL"),
+    "shop_review_count": ("クチコミ件数", "販売店のクチコミの件数。クチコミが無ければ NULL"),
+    "detail_url": ("詳細ページURL", "車両の詳細ページの URL"),
+    "ingest_date": ("取り込み日", "初めて取り込んだ日（JST）"),
+    "is_delisted": ("掲載終了フラグ", "sitemap から消えたら true、戻ったら false"),
+    "delisted_date": ("掲載終了判定日", "掲載終了と判定した日（JST）。実際に終了した日ではなく照合した日"),
+    "last_seen_date": ("最終掲載確認日", "一覧か sitemap で掲載中と確認できた最後の日（JST）"),
 }
 
 
@@ -153,7 +153,8 @@ def main(argv: list[str]) -> None:
 
     target = f"{args.catalog}.{args.silver_schema}.carsensor_used_car_listings{sfx}"
     spark.sql(build_sql(args.catalog, args.bronze_schema, args.silver_schema, sfx))
-    for col, comment in COLUMN_COMMENTS.items():
+    for col, (logical, desc) in COLUMNS.items():
+        comment = f"{logical}：{desc}".replace("'", "\\'")
         spark.sql(f"ALTER TABLE {target} ALTER COLUMN {col} COMMENT '{comment}'")
 
     s = spark.sql(f"""
