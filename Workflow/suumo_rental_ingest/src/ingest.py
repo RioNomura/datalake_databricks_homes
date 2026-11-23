@@ -19,6 +19,8 @@
     room_code（SUUMO の bc）は使わない。同じ部屋でも、まとめて表示される代表の広告（不動産会社）が入れ替わると
     コードが変わるため（2026-11-23 の増分で、新規扱いの約 8 割がこれだった）
   - bronze なので値はページ上の文字列のまま（「6.5万円」→ 数値 は silver でやる）
+  - 掲載終了の判定用に、実行ごとに一覧で見かけた部屋（room_id）を suumo_rental_sightings に、
+    実行の結果（モード・最後まで読めたか）を suumo_rental_ingest_runs に書く
 
 ジョブからは spark_python_task として起動される。parse_list_page() / crawl() は Spark に依存しないので、ローカルで確認できる。
 """
@@ -27,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import random
 import re
 import sys
@@ -82,6 +85,12 @@ def room_key(row) -> str | None:
     if not values[0] or not values[1]:
         return None
     return "\x1f".join(v or "" for v in values)
+
+
+def room_id(row) -> str | None:
+    """room_key の SHA-256（16 進）。silver の room_id と同じ値（SQL では sha2(concat_ws(char(31), ...), 256)）。"""
+    key = room_key(row)
+    return hashlib.sha256(key.encode("utf-8")).hexdigest() if key else None
 
 
 def _text(el) -> str | None:
@@ -265,6 +274,8 @@ def main(argv: list[str]) -> None:
     p.add_argument("--schema", required=True)
     p.add_argument("--table", default="suumo_rental_listings")
     p.add_argument("--state-table", default="suumo_rental_ingest_state")
+    p.add_argument("--sightings-table", default="suumo_rental_sightings")
+    p.add_argument("--runs-table", default="suumo_rental_ingest_runs")
     p.add_argument("--list-url", required=True, help="新着順（po1=09）の一覧 URL")
     p.add_argument("--initial-pages", type=int, default=0,
                    help="全件読み込みで読むページ数。0 なら最後のページまで（1 以上は動作確認用）")
@@ -295,7 +306,12 @@ def main(argv: list[str]) -> None:
     spark = SparkSession.builder.getOrCreate()
     target = f"{args.catalog}.{args.schema}.{args.table}"
     state_table = f"{args.catalog}.{args.schema}.{args.state_table}"
+    sightings_table = f"{args.catalog}.{args.schema}.{args.sightings_table}"
+    runs_table = f"{args.catalog}.{args.schema}.{args.runs_table}"
     run_id = str(uuid.uuid4())
+    started_at = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+    # 見かけた日・全件読み直しの日は、日をまたいでも実行を始めた日（日本時間）にそろえる
+    run_date = dt.datetime.now(JST).date()
 
     def utc_now() -> dt.datetime:
         return dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
@@ -353,9 +369,22 @@ def main(argv: list[str]) -> None:
         ]
     )
     written = 0
+    seen: set[str] = set()  # まだ書いていない「見かけた部屋」
+    sightings_schema = T.StructType(
+        [
+            T.StructField("room_id", T.StringType()),
+            T.StructField("seen_date", T.DateType()),
+            T.StructField("ingest_mode", T.StringType()),
+            T.StructField("ingest_run_id", T.StringType()),
+        ]
+    )
 
     def on_flush(rows: list[dict], next_page: int) -> None:
         nonlocal written
+        if seen:
+            spark.createDataFrame([(rid, run_date, mode, run_id) for rid in sorted(seen)], sightings_schema) \
+                .write.mode("append").saveAsTable(sightings_table)
+            seen.clear()
         if rows:
             now = dt.datetime.now(JST)
             (
@@ -390,7 +419,9 @@ def main(argv: list[str]) -> None:
             last_page["value"] = max(lp, page)
         if page == start_page:
             print(f"サイト上の掲載物件総数: {parse_total_count(html)} / 最後のページ: {last_page['value']}")
-        return parse_list_page(html, url, page)
+        rows = parse_list_page(html, url, page)
+        seen.update(rid for rid in (room_id(r) for r in rows) if rid)
+        return rows
 
     print(f"モード: {mode} / 開始ページ: {start_page} / 取り込み済みの部屋: {len(known)} / "
           f"取り込み先: {target} / run_id: {run_id}")
@@ -426,6 +457,25 @@ def main(argv: list[str]) -> None:
         if not (result["caught_up"] or result["reached_end"] or result["blocked"]):
             print(f"上限（{args.max_pages} ページ）まで読みました。それより後ろのページの新着は、週 1 回の全件読み直しで拾います")
     print(f"完了: {result['pages']} ページを読み、新しい部屋 {written} 件を {target} に追記しました")
+    # 実行の記録。silver は ingest_mode = 'full' で reached_end かつ blocked でない回を「最後まで終わった全件読み直し」として使う
+    runs_schema = T.StructType(
+        [
+            T.StructField("ingest_run_id", T.StringType()),
+            T.StructField("ingest_mode", T.StringType()),
+            T.StructField("run_date", T.DateType()),
+            T.StructField("started_at", T.TimestampType()),
+            T.StructField("finished_at", T.TimestampType()),
+            T.StructField("pages", T.IntegerType()),
+            T.StructField("new_rows", T.IntegerType()),
+            T.StructField("reached_end", T.BooleanType()),
+            T.StructField("blocked", T.BooleanType()),
+        ]
+    )
+    spark.createDataFrame(
+        [(run_id, mode, run_date, started_at, utc_now(), result["pages"], written,
+          bool(result["reached_end"]), bool(result["blocked"]))],
+        runs_schema,
+    ).write.mode("append").saveAsTable(runs_table)
     if result["blocked"]:
         raise RuntimeError("サイトのボット対策に止められました。再試行や回避はしません。取り込み方を見直してください")
 
