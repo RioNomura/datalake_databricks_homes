@@ -2,7 +2,7 @@ resources:
   jobs:
     suumo_rental_ingest:
       name: suumo_rental_ingest
-      description: SUUMO の大阪市の賃貸一覧（新着順）を bronze テーブル（${var.catalog}.${var.schema}.suumo_rental_listings）に取り込む。初回は全件、その後は毎日先頭 100 ページの新着と、週 1 回（日曜）の全件読み直し。個人の私的利用に限る
+      description: SUUMO の大阪市の賃貸一覧（新着順）を bronze テーブル（${var.catalog}.${var.schema}.suumo_rental_listings）に取り込む。初回は全件、その後は毎日先頭 100 ページの新着と、週 1 回（日曜）の全件読み直し。取り込んだ後に silver（${var.catalog}.silver.suumo_rental_rooms）を作り直す。個人の私的利用に限る
       # 同じジョブが重なって走り、同じページに二重にアクセスしないようにする
       max_concurrent_runs: 1
       # 全件読み込み（初回・週 1 回。約 630 ページ × 約 32 秒 ≒ 5 時間 40 分）が収まるように 7 時間。
@@ -12,7 +12,7 @@ resources:
       performance_target: STANDARD
       tags:
         source: suumo
-        layer: bronze
+        layer: bronze_silver
       # 毎日 04:00（日本時間）。日曜（full_crawl_weekday）は全件の読み直しになり、10 時ごろまでかかる。
       # pause_status は書かない。書かなければ prod では有効、dev（mode: development）では自動で一時停止になる。
       # UNPAUSED と明示すると dev でもスケジュールが動き、本番と同時に SUUMO へアクセスしてしまう（2026-11-22 に発生）
@@ -24,6 +24,9 @@ resources:
           default: ${var.catalog}
         - name: schema
           default: ${var.schema}
+        # silver の部屋テーブル（suumo_rental_rooms）を置くスキーマ
+        - name: silver_schema
+          default: silver
         # 大阪市の全 24 区・1 ページ 50 件（pc=50）・新着順（po1=09）。増分の判定は新着順が前提なので po1=09 は外さない
         - name: list_url
           default: "https://suumo.jp/jj/chintai/ichiran/FR301FC001/?ar=060&bs=040&pc=50&smk=&po1=09&po2=99&shkr1=03&shkr2=03&shkr3=03&shkr4=03&sc=27102&sc=27103&sc=27104&sc=27106&sc=27107&sc=27108&sc=27109&sc=27111&sc=27113&sc=27114&sc=27115&sc=27116&sc=27117&sc=27118&sc=27119&sc=27120&sc=27121&sc=27122&sc=27123&sc=27124&sc=27125&sc=27126&sc=27127&sc=27128&ta=27&cb=0.0&ct=9999999&et=9999999&mb=0&mt=9999999&cn=9999999&fw2="
@@ -71,3 +74,16 @@ resources:
               - --full-crawl-weekday={{job.parameters.full_crawl_weekday}}
               - --mode={{job.parameters.mode}}
               - --delay={{job.parameters.delay_seconds}}
+        # bronze から silver の部屋テーブルを作り直す（数値・配列に整え、掲載中かどうかを付ける）。
+        # 取り込みが途中で止まっても（ボット対策・タイムアウト）、それまでに入った分で作り直す
+        - task_key: build_silver
+          depends_on:
+            - task_key: ingest
+          run_if: ALL_DONE
+          environment_key: scraper
+          spark_python_task:
+            python_file: ../src/build_silver.py
+            parameters:
+              - --catalog={{job.parameters.catalog}}
+              - --bronze-schema={{job.parameters.schema}}
+              - --silver-schema={{job.parameters.silver_schema}}
