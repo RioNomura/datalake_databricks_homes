@@ -2,11 +2,11 @@ resources:
   jobs:
     carsensor_used_car_ingest:
       name: carsensor_used_car_ingest
-      description: カーセンサーの中古車一覧（関西・関東、修復歴なし、AT、メーカー系販売店、新着順）を bronze テーブル（${var.catalog}.${var.schema}.carsensor_used_car_listings）に取り込む。初回は全件、その後は新しく掲載された車だけ。掲載終了は sitemap で毎日判定する。画像は取らない。個人の私的利用に限る
+      description: カーセンサーの中古車一覧（関西・関東、修復歴なし、AT、メーカー系販売店、新着順）を bronze（${var.catalog}.${var.schema}.carsensor_used_car_listings）に取り込み、型変換した silver（${var.catalog}.${var.silver_schema}.carsensor_used_car_listings）を作り直す。初回は全件、その後は新しく掲載された車だけ。駆動方式・エンジン種別は絞り込みの一覧から、掲載終了は sitemap で毎日判定する。画像は取らない。個人の私的利用に限る
       # 同じジョブが重なって走り、同じページに二重にアクセスしないようにする
       max_concurrent_runs: 1
-      # 初回の全件読み込み（約 2,100 ページ × 約 11 秒 ≒ 6 時間 30 分）が収まるように 7 時間。
-      # 超えて止まっても、20 ページごとに保存した再開位置から次の実行で続ける
+      # 7 時間。初回は一覧（約 2,100 ページ）と絞り込み（約 1,500 ページ）で約 10 時間かかり収まらないので、
+      # スクリプトが time_budget_minutes で区切って成功扱いで終わり、次の実行で続きから読む（初回は 2 日がかり）
       timeout_seconds: 25200
       # 急ぎのジョブではないので、起動は遅いが安い STANDARD にする
       performance_target: STANDARD
@@ -23,6 +23,11 @@ resources:
           default: ${var.catalog}
         - name: schema
           default: ${var.schema}
+        - name: silver_schema
+          default: ${var.silver_schema}
+        # テーブル名の末尾（dev は _dev。本番は空）
+        - name: table_suffix
+          default: ${var.table_suffix}
         # 地域: 関東（1）+ 関西（2）（AR=1*2。画面のタイトルは「関東他」と出るが、両方を選んだ状態）・
         # 修復歴なし（OPTCD=REP0）・ミッション AT（SLST=AT）・メーカー系販売店（DLR=1）・新着順（SORT=19）。
         # 2026-11-22 時点で 関東 41,327 台 + 関西 21,357 台 = 62,684 台。増分の判定は新着順が前提なので SORT=19 は外さない
@@ -43,6 +48,12 @@ resources:
         # sitemap と照合して掲載終了フラグ（is_delisted）を更新するか
         - name: delist_check
           default: "true"
+        # 絞り込み（4WD・ディーゼル・ハイブリッド・電気・その他）の一覧を読んで、駆動方式・エンジン種別を付けるか
+        - name: facets
+          default: "true"
+        # 一覧・絞り込みを読む時間の上限（分）。ジョブの制限時間 7 時間から、sitemap の照合と silver の作成の分を引いた値
+        - name: time_budget_minutes
+          default: "380"
       # Python スクリプトのタスクが使うライブラリ。バージョンを固定して、更新で突然壊れないようにする
       environments:
         - environment_key: scraper
@@ -67,3 +78,19 @@ resources:
               - --stop-after-known-pages={{job.parameters.stop_after_known_pages}}
               - --delay={{job.parameters.delay_seconds}}
               - --delist-check={{job.parameters.delist_check}}
+              - --facets={{job.parameters.facets}}
+              - --time-budget-minutes={{job.parameters.time_budget_minutes}}
+              - --table-suffix={{job.parameters.table_suffix}}
+        # bronze を型変換して silver を作り直す。取り込みが途中で止まっても（ボット対策など）、それまでの bronze で作る
+        - task_key: silver
+          depends_on:
+            - task_key: ingest
+          run_if: ALL_DONE
+          environment_key: scraper
+          spark_python_task:
+            python_file: ../src/silver.py
+            parameters:
+              - --catalog={{job.parameters.catalog}}
+              - --bronze-schema={{job.parameters.schema}}
+              - --silver-schema={{job.parameters.silver_schema}}
+              - --table-suffix={{job.parameters.table_suffix}}
