@@ -10,6 +10,7 @@
 ```
 Workflow/
 ├── suumo_rental_ingest/              SUUMO 賃貸データの取り込みジョブ（1 フォルダ = 1 バンドル）
+├── suumo_rental_gold/                SUUMO の分析用データマート（gold）を作るジョブ
 ├── carsensor_used_car_ingest/        カーセンサー中古車データの取り込みジョブ
 └── homes_rental_ingest/              HOME'S 賃貸データの取り込みジョブ（雛形。ボット対策で止められるため保留）
     ├── databricks.yml                バンドル設定と dev / prod ターゲット
@@ -69,6 +70,20 @@ scripts/notion_sync_bundle.py         デプロイ結果を Notion「リソー�
   - sitemap の更新時刻より後に取り込んだ車は判定しない。sitemap が 1 つでも取れない、または 1 日で掲載中の 20% を超える車が消えたときは異常とみなして更新しない
 - 実行: 毎日 05:00 JST（prod のみ）
 - 価格の変更は追わない（1 台 1 行・初めて見つけたときの内容）
+
+## suumo_rental_gold（SUUMO の分析用データマート）
+
+silver（`rental_property.silver.suumo_rental_rooms`）から gold のテーブルを毎日 12:00 JST に作り直す（日曜の全件読み直しが終わった後になるよう 12:00）。semantic スキーマのメトリクスビュー、ダッシュボード、Genie から使う前提で、全テーブル・全列にコメントを付ける。
+
+| テーブル | 1 行 | 用途 |
+|---|---|---|
+| `gold.suumo_room_fact` | 1 部屋（主キー `room_id`、掲載終了も含む） | 相場（区・駅・間取り別の月額・m² 単価）、初期費用、お得物件 |
+| `gold.suumo_rent_factor_effects` | 1 つの条件の比較 | 徒歩・築年数・階・建物種別・間取り・広さ・駅が月額を何% / 何円動かすか |
+| `gold.suumo_rent_model_metrics` | 1 日（追記） | 賃料モデルの精度（決定係数・誤差の中央値） |
+
+- 月額 = 賃料 + 管理費。初期費用の目安 = 敷金 + 礼金 + 1 か月分の月額（仲介手数料などは含まない）
+- 賃料モデル: 月額の対数を、最寄り駅・間取り・建物種別・階の帯・面積・徒歩・築年数・建物の階数で最小二乗法により当てはめる（numpy）。外れ値（入力ミスとみられる部屋、`is_outlier`）は学習から除く
+- お得度（`deal_score`）= 1 − 実際の月額 ÷ モデルの妥当な月額。掲載中の部屋に順位（`deal_rank`）を付ける
 
 ## CI/CD の流れ
 

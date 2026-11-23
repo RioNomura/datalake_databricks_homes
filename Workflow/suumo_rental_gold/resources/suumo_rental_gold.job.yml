@@ -1,0 +1,43 @@
+resources:
+  jobs:
+    suumo_rental_gold:
+      name: suumo_rental_gold
+      description: >-
+        SUUMO 大阪市の賃貸の silver（${var.catalog}.${var.silver_schema}.suumo_rental_rooms）から、
+        分析用の gold テーブル（suumo_room_fact / suumo_rent_factor_effects / suumo_rent_model_metrics）を毎日作り直す。
+        semantic のメトリクスビュー・ダッシュボード・Genie から使う。個人の私的利用に限る
+      max_concurrent_runs: 1
+      # 9.4 万部屋で数分。想定外に長引いたら止める
+      timeout_seconds: 3600
+      # 急ぎのジョブではないので、起動は遅いが安い STANDARD にする
+      performance_target: STANDARD
+      tags:
+        source: suumo
+        layer: gold
+      # 毎日 12:00（日本時間）。silver は取り込みジョブ（04:00 開始）の最後に作り直される。
+      # 日曜の全件読み直しは 10 時ごろまでかかるので、それが終わった後になるよう 12:00 にする。
+      # pause_status は書かない（prod では有効、dev では自動で一時停止）
+      schedule:
+        quartz_cron_expression: "0 0 12 * * ?"
+        timezone_id: Asia/Tokyo
+      parameters:
+        - name: catalog
+          default: ${var.catalog}
+        - name: silver_schema
+          default: ${var.silver_schema}
+        - name: gold_schema
+          default: ${var.gold_schema}
+      # pandas / numpy はサーバーレスの環境に最初から入っているので、追加のライブラリは無い
+      environments:
+        - environment_key: default
+          spec:
+            environment_version: "4"
+      tasks:
+        - task_key: build_gold
+          environment_key: default
+          spark_python_task:
+            python_file: ../src/build_gold.py
+            parameters:
+              - --catalog={{job.parameters.catalog}}
+              - --silver-schema={{job.parameters.silver_schema}}
+              - --gold-schema={{job.parameters.gold_schema}}
