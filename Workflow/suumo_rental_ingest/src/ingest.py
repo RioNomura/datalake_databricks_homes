@@ -10,8 +10,14 @@
   - 初回（全件読み込み）: 新着順の先頭から最後のページまで読む（大阪市で約 630 ページ、30 秒間隔で約 6 時間）。
     --initial-pages を 1 以上にすると、そのページ数で止めて完了扱いにする（動作確認用）
     途中で止まっても続きから読めるよう、ページを書き込むたびに再開位置を状態テーブルに保存し、次の実行で続きから読む
-  - 全件読み込みが終わった後（増分）: 新着順の先頭から読み、新しい部屋が無いページが --stop-after-known-pages 回続いたら止める
-  - すでに取り込んだ部屋（room_code = SUUMO の bc）は書かない。テーブルは 1 部屋 1 行（初めて見つけたときの内容）
+  - 全件読み込みが終わった後:
+      - 毎日（増分）: 新着順の先頭から --max-pages ページ（既定 100）まで読む。
+        新しい部屋が無いページが --stop-after-known-pages 回続いたら、そこで止める
+      - 週 1 回（--full-crawl-weekday の曜日。既定は日曜）: 最後のページまで全部読み直し、増分で取りこぼした部屋を拾う
+        （新着順でも、読んでいる間に掲載終了で一覧が詰まると読み飛ばしが出るため。2026-11-23 の増分で確認）
+  - すでに取り込んだ部屋は書かない。同じ部屋かどうかは room_key（建物名・所在地・階・間取り・面積）で判定する。
+    room_code（SUUMO の bc）は使わない。同じ部屋でも、まとめて表示される代表の広告（不動産会社）が入れ替わると
+    コードが変わるため（2026-11-23 の増分で、新規扱いの約 8 割がこれだった）
   - bronze なので値はページ上の文字列のまま（「6.5万円」→ 数値 は silver でやる）
 
 ジョブからは spark_python_task として起動される。parse_list_page() / crawl() は Spark に依存しないので、ローカルで確認できる。
@@ -62,6 +68,17 @@ COLUMNS = [
     "page",
 ]
 ARRAY_COLUMNS = {"access", "tags"}
+
+# 同じ部屋かどうかを判定する列。silver で部屋をまとめるときも同じ列を使う
+ROOM_KEY_COLUMNS = ("building_name", "address", "floor", "layout", "area")
+
+
+def room_key(row) -> str | None:
+    """部屋を見分けるキー。建物名か所在地が取れなかった行は判定できないので None（書き込まない）。"""
+    values = [row[c] if not isinstance(row, dict) else row.get(c) for c in ROOM_KEY_COLUMNS]
+    if not values[0] or not values[1]:
+        return None
+    return "\x1f".join(v or "" for v in values)
 
 
 def _text(el) -> str | None:
@@ -213,7 +230,7 @@ def crawl(
         pages += 1
         new_rows = []
         for r in rows:
-            key = r.get("room_code")
+            key = room_key(r)
             if key and key not in known:
                 known.add(key)
                 new_rows.append(r)
@@ -248,8 +265,13 @@ def main(argv: list[str]) -> None:
     p.add_argument("--list-url", required=True, help="新着順（po1=09）の一覧 URL")
     p.add_argument("--initial-pages", type=int, default=0,
                    help="全件読み込みで読むページ数。0 なら最後のページまで（1 以上は動作確認用）")
-    p.add_argument("--max-pages", type=int, default=400, help="増分の 1 回で読む最大ページ数（止まらなくなったときの安全装置）")
+    p.add_argument("--max-pages", type=int, default=100, help="増分の 1 回で読む最大ページ数")
     p.add_argument("--stop-after-known-pages", type=int, default=3)
+    p.add_argument("--full-crawl-weekday", default="sun",
+                   help="全件を読み直す曜日（日本時間。mon〜sun）。none なら週 1 回の全件読み直しをしない")
+    p.add_argument("--mode", default="auto", choices=["auto", "incremental", "full"],
+                   help="auto なら曜日で決める。手動で実行するときに incremental / full を指定できる"
+                        "（初回の全件読み込みが終わっていなければ、どれを指定しても初回の続きを読む）")
     p.add_argument("--delay", type=float, default=30.0, help="リクエストの間隔（秒）。robots.txt の Crawl-delay に合わせる")
     p.add_argument("--flush-pages", type=int, default=20)
     args = p.parse_args(argv)
@@ -258,6 +280,10 @@ def main(argv: list[str]) -> None:
         raise ValueError("list_url は新着順（po1=09）にしてください。増分の判定が新着順を前提にしているため")
     if args.delay < 30:
         raise ValueError("delay は 30 秒以上にしてください（robots.txt の Crawl-delay に合わせる運用ルール）")
+    weekdays = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+    full_weekday = args.full_crawl_weekday.strip().lower()
+    if full_weekday not in weekdays + ["none"]:
+        raise ValueError(f"full_crawl_weekday は {', '.join(weekdays)} か none にしてください: {args.full_crawl_weekday}")
 
     from pyspark.sql import SparkSession
     from pyspark.sql import functions as F
@@ -279,19 +305,26 @@ def main(argv: list[str]) -> None:
             T.StructField("initial_load_started_at", T.TimestampType()),
             T.StructField("initial_load_completed_at", T.TimestampType()),
             T.StructField("last_run_id", T.StringType()),
-            T.StructField("last_mode", T.StringType()),
+            T.StructField("last_mode", T.StringType()),  # initial / incremental / full
+            T.StructField("last_full_crawl_completed_at", T.TimestampType()),  # 週 1 回の全件読み直しが最後まで終わった時刻
             T.StructField("updated_at", T.TimestampType()),
         ]
     )
 
     def write_state(st: dict) -> None:
         st = {**st, "last_run_id": run_id, "updated_at": utc_now()}
+        # 列を足したときに上書きできるよう overwriteSchema を付ける（1 行だけの状態テーブルなので問題ない）
         spark.createDataFrame([tuple(st.get(f.name) for f in state_schema)], state_schema) \
-            .write.mode("overwrite").saveAsTable(state_table)
+            .write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(state_table)
 
     state = spark.table(state_table).first().asDict() if spark.catalog.tableExists(state_table) else None
     if state and state.get("initial_load_status") == "completed":
-        mode, start_page = "incremental", 1
+        if args.mode == "auto":
+            is_full_day = weekdays[dt.datetime.now(JST).weekday()] == full_weekday
+            mode = "full" if is_full_day else "incremental"
+        else:
+            mode = args.mode
+        start_page = 1
         state["last_mode"] = mode
     else:
         mode = "initial"
@@ -305,7 +338,8 @@ def main(argv: list[str]) -> None:
 
     known: set[str] = set()
     if spark.catalog.tableExists(target):
-        known = {r[0] for r in spark.table(target).select("room_code").where("room_code IS NOT NULL").distinct().collect()}
+        rows = spark.table(target).select(*ROOM_KEY_COLUMNS).distinct().collect()
+        known = {k for k in (room_key(r) for r in rows) if k}
 
     schema = T.StructType(
         [
@@ -371,13 +405,23 @@ def main(argv: list[str]) -> None:
             print("全件読み込みが完了しました。次の実行からは増分になります")
         else:
             print(f"全件読み込みの途中で止まりました。次の実行は page {result['next_page']} から続けます")
+    elif mode == "full":
+        # 週 1 回の全件読み直し。途中で止まっても再開はしない（翌週にまた最初から読む）
+        result = crawl(fetch_page, known, max_pages=0, stop_after_known_pages=0,
+                       flush_pages=args.flush_pages, on_flush=on_flush,
+                       last_page=lambda: last_page["value"])
+        if result["reached_end"] and not result["blocked"]:
+            state["last_full_crawl_completed_at"] = utc_now()
+            print("全件の読み直しが最後まで終わりました")
+        else:
+            print(f"注意: 全件の読み直しが page {result['next_page']} で止まりました。続きは翌週の全件読み直しで読みます")
+        write_state(state)
     else:
         result = crawl(fetch_page, known, max_pages=args.max_pages, stop_after_known_pages=args.stop_after_known_pages,
                        flush_pages=args.flush_pages, on_flush=on_flush)
         write_state(state)
         if not (result["caught_up"] or result["reached_end"] or result["blocked"]):
-            print(f"注意: 取り込み済みの部屋に追いつく前に上限（{args.max_pages} ページ）に達しました。"
-                  "この間の新着は取りこぼしている可能性があります。max_pages か実行頻度を見直してください")
+            print(f"上限（{args.max_pages} ページ）まで読みました。それより後ろのページの新着は、週 1 回の全件読み直しで拾います")
     print(f"完了: {result['pages']} ページを読み、新しい部屋 {written} 件を {target} に追記しました")
     if result["blocked"]:
         raise RuntimeError("サイトのボット対策に止められました。再試行や回避はしません。取り込み方を見直してください")
