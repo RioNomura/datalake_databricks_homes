@@ -23,6 +23,17 @@
   - sitemap の更新時刻より後に取り込んだ車は、まだ sitemap に載っていないだけなので判定しない
   - sitemap が 1 つでも取れない、または 1 日で掲載中の 20% を超える車が消えた場合は、sitemap 側の異常とみなしてフラグを更新しない
 
+駆動方式・エンジン種別（carsensor_used_car_attributes）:
+  - 一覧の各車の欄には出ていないので、一覧の絞り込み条件（KUDO=駆動方式、FUEL=燃料）ごとに同じ新着順の一覧を読み、
+    そこに出てきた車に「4WD」「ハイブリッド」などの値を付ける（FACETS）。詳細ページには行かない
+  - 一番多い区分（2WD・ガソリン）は読まない。どの絞り込みにも出てこなかった車を silver で 2WD・ガソリンとみなす
+    （絞り込みの全件読み込みが終わってから）。2026-11-22 時点で 4WD 約 1.3 万、ディーゼル・ハイブリッド・電気・その他 約 3.1 万台
+  - 全件読み込み・増分・再開の仕組みは一覧と同じ。進み具合は carsensor_used_car_attr_state に絞り込みごとに保存する
+
+1 回の実行時間:
+  - 初回は一覧と絞り込みを合わせて約 3,500 ページ（約 10 時間）あり、ジョブの制限時間（7 時間）に収まらない。
+    --time-budget-minutes を超えたらページの区切りで止めて成功扱いで終わり、次の実行で続きから読む
+
 ジョブからは spark_python_task として起動される。parse_list_page() / parse_sitemap() / crawl() は Spark に依存しないので、ローカルで確認できる。
 """
 
@@ -51,11 +62,24 @@ USER_AGENT = (
 JST = dt.timezone(dt.timedelta(hours=9))
 MIN_DELAY = 10.0
 
+# 駆動方式・エンジン種別を付けるための絞り込み（一覧 URL に足すパラメータ）。
+# 一番多い区分（KUDO=4WD0 の 2WD、FUEL=1 のガソリン）は読まず、silver で「どれにも出なかった車」として扱う
+FACETS = [
+    # (キー, 属性, 値, 一覧 URL に足すパラメータ)
+    ("drive_4wd", "drive_type", "4WD", "KUDO=4WD1"),
+    ("fuel_diesel", "engine_type", "ディーゼル", "FUEL=2"),
+    ("fuel_hybrid", "engine_type", "ハイブリッド", "FUEL=3"),
+    ("fuel_electric", "engine_type", "電気", "FUEL=4"),
+    ("fuel_other", "engine_type", "その他", "FUEL=9"),
+]
+
 # bronze テーブルの列（掲載終了フラグの列を除く）。すべてページ上の文字列のまま（labels は文字列の配列）
 COLUMNS = [
     "car_id",  # 物件番号（BKKN）。詳細ページ URL /usedcar/detail/<car_id>/ と同じ
     "maker",  # メーカー（例: トヨタ）
     "title",  # 車名・グレード・装備（例: ヤリスクロス 1.5 ハイブリッド Z ...）
+    "car_model",  # 車名（例: ヤリスクロス）。一覧の見出しのノーブレークスペースで区切られた 1 つ目
+    "car_grade",  # グレード（例: 1.5 ハイブリッド Z）。同じく 2 つ目（3 つ目以降は販売店が書いた装備などの文言）
     "sub_text",  # 販売店のひとこと
     "labels",  # ラベル（ディーラー保証 / 360°画像付 など）の配列
     "listed_label",  # 一覧の掲載日ラベル（例: 11/22）。新着のときだけ出る
@@ -113,6 +137,8 @@ def parse_list_page(html: str, source_url: str, page: int) -> list[dict]:
         maker_el = title_wrap.find_previous_sibling("p") if title_wrap else None
         link = cas.select_one("a.cassetteMain__link")
         href = link.get("href") if link else None
+        # 見出しは「車名 NBSP グレード NBSP 販売店の文言」の形。空白をまとめる前の文字列で分ける
+        title_parts = [t.strip() for t in link.get_text().split("\xa0")] if link else []
         body = [_text(li) for li in cas.select(".carBodyInfoList__item")]
         area = [_text(p) for p in cas.select(".cassetteSub__area p")]
         shop = cas.select_one(".cassetteSub__shop a")
@@ -123,6 +149,8 @@ def parse_list_page(html: str, source_url: str, page: int) -> list[dict]:
             "car_id": car_id,
             "maker": _text(maker_el),
             "title": _text(link),
+            "car_model": (title_parts[0] or None) if len(title_parts) > 0 else None,
+            "car_grade": (title_parts[1] or None) if len(title_parts) > 1 else None,
             "sub_text": _text(cas.select_one(".cassetteMain__subText")),
             "labels": [t for t in (_text(s) for s in cas.select(".cassetteMain__label > span")) if t],
             "listed_label": _text(cas.select_one(".labelIcon--data")),
@@ -235,6 +263,11 @@ class Fetcher:
         raise RuntimeError(f"{self.max_retries} 回試しても取得できませんでした: {url}")
 
 
+def facet_url(list_url: str, param: str) -> str:
+    """一覧 URL に絞り込みのパラメータ（例: KUDO=4WD1）を足す。"""
+    return f"{list_url}&{param}"
+
+
 def page_url(list_url: str, page: int) -> str:
     """1 ページ目の URL（/usedcar/index.html?...）から n ページ目（/usedcar/index{n}.html?...）を作る。"""
     if page == 1:
@@ -251,6 +284,7 @@ def crawl(
     on_flush,
     start_page: int = 1,
     last_page=lambda: None,
+    should_stop=lambda: False,
 ) -> dict:
     """新着順の start_page から読み、まだ取り込んでいない車だけを集める。
 
@@ -258,12 +292,16 @@ def crawl(
     on_flush(rows, next_page) を flush_pages ページごとと最後に呼ぶ（next_page = 次に読むページ = 再開位置）。
     stop_after_known_pages が 0 なら「追いついたら止める」はせず、max_pages（0 なら無制限）か最後のページまで読む。
     last_page() は最後のページ番号（分かれば）。そのページを読んだら reached_end で止める。
+    should_stop() が True を返したら、そのページの後で止める（time_up。1 回の実行時間の上限）。
     """
     buf: list[dict] = []
     pages = new_total = streak = 0
-    caught_up = reached_end = blocked = False
+    caught_up = reached_end = blocked = time_up = False
     page = start_page
     while True:
+        if should_stop():
+            time_up = True
+            break
         try:
             rows = fetch_page(page)
         except Blocked as e:
@@ -301,7 +339,7 @@ def crawl(
             break
     on_flush(buf, page)
     return {"pages": pages, "new_rows": new_total, "next_page": page, "caught_up": caught_up,
-            "reached_end": reached_end, "blocked": blocked}
+            "reached_end": reached_end, "blocked": blocked, "time_up": time_up}
 
 
 def fetch_sitemap_car_ids(fetcher: Fetcher) -> tuple[set[str], dt.datetime | None]:
@@ -336,18 +374,28 @@ def main(argv: list[str]) -> None:
     p.add_argument("--schema", required=True)
     p.add_argument("--table", default="carsensor_used_car_listings")
     p.add_argument("--state-table", default="carsensor_used_car_ingest_state")
+    p.add_argument("--attr-table", default="carsensor_used_car_attributes")
+    p.add_argument("--attr-state-table", default="carsensor_used_car_attr_state")
     p.add_argument("--list-url", required=True, help="新着順（SORT=19）の一覧 URL（/usedcar/index.html?...）")
     p.add_argument("--initial-pages", type=int, default=0,
-                   help="全件読み込みで読むページ数。0 なら最後のページまで（1 以上は動作確認用）")
+                   help="全件読み込みで読むページ数（一覧・絞り込みそれぞれ）。0 なら最後のページまで（1 以上は動作確認用）")
     p.add_argument("--max-pages", type=int, default=300, help="増分の 1 回で読む最大ページ数（止まらなくなったときの安全装置）")
     p.add_argument("--stop-after-known-pages", type=int, default=3)
     p.add_argument("--delay", type=float, default=MIN_DELAY, help=f"リクエストの間隔（秒）。{MIN_DELAY:.0f} 秒以上")
     p.add_argument("--flush-pages", type=int, default=20)
+    p.add_argument("--facets", choices=["true", "false"], default="true",
+                   help="絞り込みの一覧を読んで駆動方式・エンジン種別を付けるか")
     p.add_argument("--delist-check", choices=["true", "false"], default="true",
                    help="sitemap で掲載終了フラグを更新するか")
     p.add_argument("--max-delist-ratio", type=float, default=0.2,
                    help="1 回で掲載終了にしてよい割合の上限。超えたら sitemap の異常とみなして更新しない")
+    p.add_argument("--time-budget-minutes", type=float, default=380,
+                   help="一覧・絞り込みを読む時間の上限（分）。超えたら区切りで止めて次の実行で続ける。"
+                        "ジョブの制限時間（7 時間）から sitemap の照合（約 10 分）とサーバーレスの起動を引いた値")
+    p.add_argument("--table-suffix", default="", help="テーブル名の末尾（dev は _dev）")
     args = p.parse_args(argv)
+    if args.table_suffix and not re.fullmatch(r"_[a-z0-9]+", args.table_suffix):
+        raise ValueError("table_suffix は _dev のように、アンダースコア + 英小文字・数字にしてください")
 
     if "SORT=19" not in args.list_url or "/usedcar/index.html" not in args.list_url:
         raise ValueError("list_url は新着順（SORT=19）の 1 ページ目（/usedcar/index.html?...）にしてください。増分の判定が新着順を前提にしているため")
@@ -359,14 +407,77 @@ def main(argv: list[str]) -> None:
     from pyspark.sql import types as T
 
     spark = SparkSession.builder.getOrCreate()
-    target = f"{args.catalog}.{args.schema}.{args.table}"
-    state_table = f"{args.catalog}.{args.schema}.{args.state_table}"
+    sfx = args.table_suffix
+    target = f"{args.catalog}.{args.schema}.{args.table}{sfx}"
+    state_table = f"{args.catalog}.{args.schema}.{args.state_table}{sfx}"
+    attr_table = f"{args.catalog}.{args.schema}.{args.attr_table}{sfx}"
+    attr_state_table = f"{args.catalog}.{args.schema}.{args.attr_state_table}{sfx}"
     run_id = str(uuid.uuid4())
+    deadline = time.monotonic() + args.time_budget_minutes * 60
+
+    def should_stop() -> bool:
+        return time.monotonic() > deadline
 
     def utc_now() -> dt.datetime:
         return dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
 
-    # ---- 状態（全件読み込みの進み具合と、最後の掲載終了チェック）。1 行だけのテーブル
+    def now_cols(df):
+        now = dt.datetime.now(JST)
+        return (
+            df.withColumn("ingest_run_id", F.lit(run_id))
+            .withColumn("ingested_at", F.lit(now.astimezone(dt.timezone.utc).replace(tzinfo=None)).cast("timestamp"))
+            .withColumn("ingest_date", F.lit(now.date().isoformat()).cast("date"))
+        )
+
+    fetcher = Fetcher(delay=args.delay)
+
+    def make_fetch_page(list_url: str, start_page: int, last_page: dict):
+        def fetch_page(page: int) -> list[dict]:
+            url = page_url(list_url, page)
+            try:
+                html = fetcher.get(url)
+            except requests.HTTPError as e:
+                print(f"page {page} を取得できませんでした（最後のページを過ぎたとみなす）: {e}")
+                return []
+            # 新着が増えると最後のページ番号も増えるので、毎ページ読み直す
+            lp = parse_last_page(html)
+            if lp:
+                last_page["value"] = max(lp, page)
+            if page == start_page:
+                total = parse_total_count(html)
+                print(f"サイト上の掲載台数: {total} / 最後のページ: {last_page['value']}")
+                # 文字コードを読み違えると、件数の「台」が化ける。化けたまま書き込まないよう、ここで止める
+                if not total or not total.endswith("台"):
+                    raise RuntimeError(f"掲載台数を正しく読めませんでした（文字化けかページ構造の変更）: {total!r}")
+            return parse_list_page(html, url, page)
+        return fetch_page
+
+    def run_crawl(list_url: str, mode: str, start_page: int, known: set[str], on_flush) -> dict:
+        """一覧（または絞り込みの一覧）を、全件読み込み（initial）か増分（incremental）で読む。"""
+        last_page: dict[str, int | None] = {"value": None}
+        fetch_page = make_fetch_page(list_url, start_page, last_page)
+        if mode == "initial":
+            remaining = args.initial_pages - (start_page - 1) if args.initial_pages else 0
+            if args.initial_pages and remaining <= 0:
+                remaining = 1
+            result = crawl(fetch_page, known, max_pages=remaining, stop_after_known_pages=0,
+                           flush_pages=args.flush_pages, on_flush=on_flush, start_page=start_page,
+                           last_page=lambda: last_page["value"], should_stop=should_stop)
+            limit_reached = bool(args.initial_pages) and result["next_page"] > args.initial_pages
+            result["completed"] = (result["reached_end"] or limit_reached) and not result["blocked"]
+        else:
+            result = crawl(fetch_page, known, max_pages=args.max_pages, stop_after_known_pages=args.stop_after_known_pages,
+                           flush_pages=args.flush_pages, on_flush=on_flush, should_stop=should_stop)
+            if not (result["caught_up"] or result["reached_end"] or result["blocked"] or result["time_up"]):
+                print(f"注意: 取り込み済みの車に追いつく前に上限（{args.max_pages} ページ）に達しました。"
+                      "この間の新着は取りこぼしている可能性があります。max_pages か実行頻度を見直してください")
+        if result["time_up"]:
+            print(f"実行時間の上限（{args.time_budget_minutes:.0f} 分）に達したため、page {result['next_page']} の手前で止めました。次の実行で続けます")
+        return result
+
+    blocked = False
+
+    # ================= 1. 一覧（車の基本情報） =================
     state_schema = T.StructType(
         [
             T.StructField("initial_load_status", T.StringType()),  # in_progress / completed
@@ -418,17 +529,14 @@ def main(argv: list[str]) -> None:
     def on_flush(rows: list[dict], next_page: int) -> None:
         nonlocal written
         if rows:
-            now = dt.datetime.now(JST)
+            today = dt.datetime.now(JST).date().isoformat()
             (
-                spark.createDataFrame([tuple(r.get(c) for c in COLUMNS) for r in rows], schema)
-                .withColumn("ingest_mode", F.lit(mode))
-                .withColumn("ingest_run_id", F.lit(run_id))
-                .withColumn("ingested_at", F.lit(now.astimezone(dt.timezone.utc).replace(tzinfo=None)).cast("timestamp"))
-                .withColumn("ingest_date", F.lit(now.date().isoformat()).cast("date"))
+                now_cols(spark.createDataFrame([tuple(r.get(c) for c in COLUMNS) for r in rows], schema)
+                         .withColumn("ingest_mode", F.lit(mode)))
                 # 掲載終了フラグ。一覧に出ていた = 掲載中。あとで sitemap との照合で更新する
                 .withColumn("is_delisted", F.lit(False))
                 .withColumn("delisted_date", F.lit(None).cast("date"))
-                .withColumn("last_seen_date", F.lit(now.date().isoformat()).cast("date"))
+                .withColumn("last_seen_date", F.lit(today).cast("date"))
                 .write.mode("append")
                 .option("mergeSchema", "true")
                 .saveAsTable(target)
@@ -439,56 +547,88 @@ def main(argv: list[str]) -> None:
             state["next_page"] = next_page
             write_state(state)
 
-    fetcher = Fetcher(delay=args.delay)
-    last_page: dict[str, int | None] = {"value": None}
-
-    def fetch_page(page: int) -> list[dict]:
-        url = page_url(args.list_url, page)
-        try:
-            html = fetcher.get(url)
-        except requests.HTTPError as e:
-            print(f"page {page} を取得できませんでした（最後のページを過ぎたとみなす）: {e}")
-            return []
-        # 新着が増えると最後のページ番号も増えるので、毎ページ読み直す
-        lp = parse_last_page(html)
-        if lp:
-            last_page["value"] = max(lp, page)
-        if page == start_page:
-            total = parse_total_count(html)
-            print(f"サイト上の掲載台数: {total} / 最後のページ: {last_page['value']}")
-            # 文字コードを読み違えると、件数の「台」が化ける。化けたまま書き込まないよう、ここで止める
-            if not total or not total.endswith("台"):
-                raise RuntimeError(f"掲載台数を正しく読めませんでした（文字化けかページ構造の変更）: {total!r}")
-        return parse_list_page(html, url, page)
-
-    print(f"モード: {mode} / 開始ページ: {start_page} / 取り込み済みの車: {len(known)} / "
+    print(f"[一覧] モード: {mode} / 開始ページ: {start_page} / 取り込み済みの車: {len(known)} / "
           f"取り込み先: {target} / run_id: {run_id}")
-    if mode == "initial":
-        remaining = args.initial_pages - (start_page - 1) if args.initial_pages else 0
-        if args.initial_pages and remaining <= 0:
-            remaining = 1
-        result = crawl(fetch_page, known, max_pages=remaining, stop_after_known_pages=0,
-                       flush_pages=args.flush_pages, on_flush=on_flush, start_page=start_page,
-                       last_page=lambda: last_page["value"])
-        limit_reached = bool(args.initial_pages) and result["next_page"] > args.initial_pages
-        if (result["reached_end"] or limit_reached) and not result["blocked"]:
-            state.update({"initial_load_status": "completed", "initial_load_completed_at": utc_now()})
-            write_state(state)
-            print("全件読み込みが完了しました。次の実行からは増分になります")
-        else:
-            print(f"全件読み込みの途中で止まりました。次の実行は page {result['next_page']} から続けます")
-    else:
-        result = crawl(fetch_page, known, max_pages=args.max_pages, stop_after_known_pages=args.stop_after_known_pages,
-                       flush_pages=args.flush_pages, on_flush=on_flush)
-        write_state(state)
-        if not (result["caught_up"] or result["reached_end"] or result["blocked"]):
-            print(f"注意: 取り込み済みの車に追いつく前に上限（{args.max_pages} ページ）に達しました。"
-                  "この間の新着は取りこぼしている可能性があります。max_pages か実行頻度を見直してください")
-    print(f"一覧: {result['pages']} ページを読み、新しい車 {written} 台を {target} に追記しました")
-    if result["blocked"]:
+    result = run_crawl(args.list_url, mode, start_page, known, on_flush)
+    blocked |= result["blocked"]
+    if mode == "initial" and result["completed"]:
+        state.update({"initial_load_status": "completed", "initial_load_completed_at": utc_now()})
+        print("[一覧] 全件読み込みが完了しました。次の実行からは増分になります")
+    elif mode == "initial":
+        print(f"[一覧] 全件読み込みの途中です。次の実行は page {result['next_page']} から続けます")
+    write_state(state)
+    print(f"[一覧] {result['pages']} ページを読み、新しい車 {written} 台を {target} に追記しました")
+
+    # ================= 2. 絞り込み（駆動方式・エンジン種別） =================
+    attr_state_schema = T.StructType(
+        [
+            T.StructField("facet_key", T.StringType()),
+            T.StructField("attribute", T.StringType()),
+            T.StructField("value", T.StringType()),
+            T.StructField("initial_load_status", T.StringType()),  # in_progress / completed
+            T.StructField("next_page", T.IntegerType()),
+            T.StructField("initial_load_completed_at", T.TimestampType()),
+            T.StructField("last_run_id", T.StringType()),
+            T.StructField("updated_at", T.TimestampType()),
+        ]
+    )
+    attr_states: dict[str, dict] = {}
+    if spark.catalog.tableExists(attr_state_table):
+        attr_states = {r["facet_key"]: r.asDict() for r in spark.table(attr_state_table).collect()}
+
+    def write_attr_states() -> None:
+        rows = [tuple(st.get(f.name) for f in attr_state_schema) for st in attr_states.values()]
+        spark.createDataFrame(rows, attr_state_schema).write.mode("overwrite") \
+            .option("overwriteSchema", "true").saveAsTable(attr_state_table)
+
+    attr_schema = T.StructType(
+        [
+            T.StructField("car_id", T.StringType()),
+            T.StructField("facet_key", T.StringType()),
+            T.StructField("attribute", T.StringType()),  # drive_type / engine_type
+            T.StructField("value", T.StringType()),  # 4WD / ディーゼル / ハイブリッド / 電気 / その他
+        ]
+    )
+
+    for key, attribute, value, param in (FACETS if args.facets == "true" else []):
+        if blocked or should_stop():
+            break
+        st = attr_states.get(key) or {"facet_key": key, "attribute": attribute, "value": value,
+                                      "initial_load_status": "in_progress", "next_page": 1}
+        f_mode = "incremental" if st.get("initial_load_status") == "completed" else "initial"
+        f_start = 1 if f_mode == "incremental" else (st.get("next_page") or 1)
+        f_known: set[str] = set()
+        if spark.catalog.tableExists(attr_table):
+            f_known = {r[0] for r in spark.table(attr_table).where(F.col("facet_key") == key).select("car_id").distinct().collect()}
+        f_written = 0
+
+        def on_attr_flush(rows: list[dict], next_page: int, key=key, attribute=attribute, value=value,
+                          st=st, f_mode=f_mode) -> None:
+            nonlocal f_written
+            if rows:
+                now_cols(spark.createDataFrame([(r["car_id"], key, attribute, value) for r in rows], attr_schema)) \
+                    .write.mode("append").option("mergeSchema", "true").saveAsTable(attr_table)
+                f_written += len(rows)
+            if f_mode == "initial":
+                st["next_page"] = next_page
+            st.update({"last_run_id": run_id, "updated_at": utc_now()})
+            attr_states[key] = st
+            write_attr_states()
+
+        print(f"[絞り込み {key}: {attribute}={value}] モード: {f_mode} / 開始ページ: {f_start} / 記録済み: {len(f_known)} 台")
+        f_result = run_crawl(facet_url(args.list_url, param), f_mode, f_start, f_known, on_attr_flush)
+        blocked |= f_result["blocked"]
+        if f_mode == "initial" and f_result["completed"]:
+            st.update({"initial_load_status": "completed", "initial_load_completed_at": utc_now()})
+            attr_states[key] = st
+            write_attr_states()
+            print(f"[絞り込み {key}] 全件読み込みが完了しました")
+        print(f"[絞り込み {key}] {f_result['pages']} ページを読み、{f_written} 台を記録しました")
+
+    if blocked:
         raise RuntimeError("サイトのボット対策に止められました。再試行や回避はしません。取り込み方を見直してください")
 
-    # ---- 掲載終了フラグの更新（sitemap との照合）
+    # ================= 3. 掲載終了フラグの更新（sitemap との照合） =================
     if args.delist_check != "true" or not spark.catalog.tableExists(target):
         return
     try:
