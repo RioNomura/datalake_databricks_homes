@@ -64,10 +64,12 @@ jobs:
         with:
           version: ${{ env.DATABRICKS_CLI_VERSION }}
 
+      # 失敗したときに PR コメントへ載せられるよう、出力をファイルにも残す
       - name: bundle validate（dev / prod）
         run: |
-          databricks bundle validate --strict -t dev
-          databricks bundle validate --strict -t prod
+          set -o pipefail
+          databricks bundle validate --strict -t dev 2>&1 | tee validate.txt
+          databricks bundle validate --strict -t prod 2>&1 | tee -a validate.txt
 
       - name: bundle plan（prod）
         run: |
@@ -80,22 +82,20 @@ jobs:
           databricks bundle summary -t prod -o json > summary.json
           python3 "$GITHUB_WORKSPACE/scripts/notion_sync_bundle.py" --plan plan.json --summary summary.json --dry-run
 
+      # infra（tfcmt）と同じ形で「Plan Result (<バンドル>)」をコメントする。前回のコメントは上書き
       - name: plan の結果を PR にコメント
         if: always()
-        uses: actions/github-script@v9
+        # コメントに失敗しても、デプロイや Notion 更新の結果には影響させない
+        continue-on-error: true
         env:
+          GITHUB_TOKEN: ${{ github.token }}
           BUNDLE_DIR: ${{ matrix.bundle }}
-        with:
-          script: |
-            const fs = require('fs');
-            const dir = process.env.BUNDLE_DIR;
-            const path = `${dir}/plan.txt`;
-            const plan = fs.existsSync(path) ? fs.readFileSync(path, 'utf8').slice(-60000) : 'plan が実行されませんでした。ログを確認してください。';
-            await github.rest.issues.createComment({
-              ...context.repo,
-              issue_number: context.issue.number,
-              body: `### bundle plan（prod）: \`${dir}\`\n\`\`\`\n${plan}\n\`\`\``
-            });
+          OUTCOME: ${{ job.status }}
+        run: |
+          log=plan.txt
+          [ -f plan.txt ] || log=validate.txt
+          python3 "$GITHUB_WORKSPACE/scripts/pr_comment.py" plan \
+            --target "$BUNDLE_DIR" --plan-json plan.json --log "$log" --outcome "$OUTCOME"
 
   deploy:
     needs: discover
@@ -126,7 +126,22 @@ jobs:
         run: databricks bundle plan -t prod -o json > plan.json
 
       - name: bundle deploy（prod）
-        run: databricks bundle deploy -t prod --auto-approve
+        run: |
+          set -o pipefail
+          databricks bundle deploy -t prod --auto-approve 2>&1 | tee deploy.txt
+
+      # マージ元の PR に「Apply Result (<バンドル>)」をコメントする。変更のないバンドルはコメントしない
+      - name: deploy の結果を PR にコメント
+        if: always()
+        # コメントに失敗しても、デプロイや Notion 更新の結果には影響させない
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          BUNDLE_DIR: ${{ matrix.bundle }}
+          OUTCOME: ${{ job.status }}
+        run: |
+          python3 "$GITHUB_WORKSPACE/scripts/pr_comment.py" apply --skip-no-changes \
+            --target "$BUNDLE_DIR" --plan-json plan.json --log deploy.txt --outcome "$OUTCOME"
 
       - name: Notion のリソース台帳を更新
         env:
