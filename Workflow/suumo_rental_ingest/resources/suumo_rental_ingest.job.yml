@@ -2,18 +2,18 @@ resources:
   jobs:
     suumo_rental_ingest:
       name: suumo_rental_ingest
-      description: SUUMO の大阪市の賃貸一覧（新着順）を bronze テーブル（${var.catalog}.${var.schema}.suumo_rental_listings）に取り込む。初回は全件、その後は新しく掲載された部屋だけ。個人の私的利用に限る
+      description: SUUMO の大阪市の賃貸一覧（新着順）を bronze テーブル（${var.catalog}.${var.schema}.suumo_rental_listings）に取り込む。初回は全件、その後は毎日先頭 100 ページの新着と、週 1 回（日曜）の全件読み直し。個人の私的利用に限る
       # 同じジョブが重なって走り、同じページに二重にアクセスしないようにする
       max_concurrent_runs: 1
-      # 初回の全件読み込み（約 630 ページ × 約 32 秒 ≒ 5 時間 40 分）が収まるように 7 時間。
-      # 超えて止まっても、20 ページごとに保存した再開位置から次の実行で続ける
+      # 全件読み込み（初回・週 1 回。約 630 ページ × 約 32 秒 ≒ 5 時間 40 分）が収まるように 7 時間。
+      # 初回は超えて止まっても、20 ページごとに保存した再開位置から次の実行で続ける
       timeout_seconds: 25200
       # 急ぎのジョブではないので、起動は遅いが安い STANDARD にする
       performance_target: STANDARD
       tags:
         source: suumo
         layer: bronze
-      # 毎日 04:00（日本時間）。
+      # 毎日 04:00（日本時間）。日曜（full_crawl_weekday）は全件の読み直しになり、10 時ごろまでかかる。
       # pause_status は書かない。書かなければ prod では有効、dev（mode: development）では自動で一時停止になる。
       # UNPAUSED と明示すると dev でもスケジュールが動き、本番と同時に SUUMO へアクセスしてしまう（2026-11-22 に発生）
       schedule:
@@ -30,12 +30,19 @@ resources:
         # 初回（全件読み込み）で読むページ数。0 なら最後のページまで（1 ページ = 50 棟）。1 以上は動作確認用
         - name: initial_pages
           default: "0"
-        # 増分の 1 回で読む最大ページ数（止まらなくなったときの安全装置）。超えたら警告を出す（その間の新着を取りこぼしている可能性）
+        # 増分（毎日）で読む最大ページ数（100 ページ ≒ 55 分）。新着はほぼ先頭 75 ページに集まる（2026-11-23 の実績）。
+        # それより後ろに出てくる部屋は、週 1 回の全件読み直しで拾う
         - name: max_pages
-          default: "400"
+          default: "100"
         # 新しい部屋が無いページがこの回数続いたら「追いついた」として止める
         - name: stop_after_known_pages
           default: "3"
+        # 全件を読み直す曜日（日本時間。mon〜sun）。none なら読み直さない
+        - name: full_crawl_weekday
+          default: "sun"
+        # auto なら曜日で決める。手動実行で incremental / full を指定すると、曜日に関係なくそのモードで読む
+        - name: mode
+          default: "auto"
         # リクエスト間隔（秒）。robots.txt の Crawl-delay（30 秒）に合わせる。30 未満はスクリプトが拒否する
         - name: delay_seconds
           default: "30"
@@ -61,4 +68,6 @@ resources:
               - --initial-pages={{job.parameters.initial_pages}}
               - --max-pages={{job.parameters.max_pages}}
               - --stop-after-known-pages={{job.parameters.stop_after_known_pages}}
+              - --full-crawl-weekday={{job.parameters.full_crawl_weekday}}
+              - --mode={{job.parameters.mode}}
               - --delay={{job.parameters.delay_seconds}}
